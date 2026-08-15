@@ -42,25 +42,26 @@ class ArchiveAppContractTests(unittest.TestCase):
         self.assertNotIn("default-keychain -s", contents)
         self.assertNotIn("list-keychains -s", contents)
 
-    def test_signed_entrypoints_prepare_the_existing_login_keychain(self) -> None:
+    def test_signed_entrypoints_validate_without_handling_keychain_passwords(self) -> None:
         helper = SIGNING_HELPER.read_text()
         archive = ARCHIVE_SCRIPT.read_text()
         build = BUILD_SCRIPT.read_text()
 
-        self.assertIn("devicehub_unlock_signing_keychain", helper)
-        self.assertIn("devicehub_default_signing_password_file", helper)
-        self.assertIn("javi-air-keychain-password", helper)
-        self.assertIn("javimini-keychain-password", helper)
+        self.assertIn("devicehub_validate_signing_keychain", helper)
         self.assertIn("login.keychain-db", helper)
-        self.assertIn("set-key-partition-list", helper)
-        self.assertIn("apple-tool:,apple:,codesign:", helper)
+        self.assertIn("security find-identity", helper)
+        self.assertNotIn("KEYCHAIN_PASSWORD", helper)
+        self.assertNotIn("unlock-keychain", helper)
+        self.assertNotIn("set-key-partition-list", helper)
         self.assertNotIn("set-keychain-settings", helper)
         self.assertNotIn("default-keychain -s", helper)
         self.assertNotIn("list-keychains -s", helper)
         self.assertIn("BuildSupport/signing_keychain.sh", archive)
         self.assertIn("BuildSupport/signing_keychain.sh", build)
-        self.assertIn("devicehub_default_signing_password_file", archive)
-        self.assertIn("devicehub_default_signing_password_file", build)
+        self.assertIn("devicehub_validate_signing_keychain", archive)
+        self.assertIn("devicehub_validate_signing_keychain", build)
+        self.assertNotIn("KEYCHAIN_PASSWORD", archive)
+        self.assertNotIn("KEYCHAIN_PASSWORD", build)
 
 
 if __name__ == "__main__":

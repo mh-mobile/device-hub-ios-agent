@@ -1,25 +1,10 @@
 #!/usr/bin/env bash
 
-# Prepare the existing macOS login keychain for one non-interactive signing run.
-# This deliberately does not change keychain lock, timeout, default, or search
-# policy, and it never creates a signing keychain.
-devicehub_default_signing_password_file() {
-  local host_id=""
-  if [[ -f "$HOME/.codex/host-id" ]]; then
-    host_id="$(<"$HOME/.codex/host-id")"
-  fi
-
-  if [[ "$host_id" == "javimini" ]]; then
-    printf '%s\n' "$HOME/.codex/secrets/javimini-keychain-password"
-  else
-    printf '%s\n' "$HOME/.codex/secrets/javi-air-keychain-password"
-  fi
-}
-
-devicehub_unlock_signing_keychain() {
+# Validate the existing macOS login keychain without handling its password or
+# changing lock, timeout, default, search-list, or item-access policy.
+devicehub_validate_signing_keychain() {
   local keychain_path="${1:?keychain path required}"
-  local password_file="${2:?password file required}"
-  local keychain_password
+  local identity_output
 
   if [[ "$keychain_path" != "$HOME/Library/Keychains/login.keychain-db" ]]; then
     echo "Signing helpers only use the existing login keychain: $keychain_path" >&2
@@ -30,19 +15,14 @@ devicehub_unlock_signing_keychain() {
     echo "Signing keychain does not exist: $keychain_path" >&2
     return 1
   fi
-  if [[ ! -f "$password_file" ]]; then
-    echo "Missing keychain password file: $password_file" >&2
+  if ! identity_output="$(/usr/bin/security find-identity -v -p codesigning "$keychain_path")"; then
+    echo "Unable to read signing identities from $keychain_path" >&2
     return 1
   fi
 
-  keychain_password="$(<"$password_file")"
-  /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain_path"
-  /usr/bin/security set-key-partition-list \
-    -S apple-tool:,apple:,codesign: \
-    -s \
-    -k "$keychain_password" \
-    "$keychain_path"
-  if /usr/bin/xattr -p com.apple.quarantine "$keychain_path" >/dev/null 2>&1; then
-    /usr/bin/xattr -d com.apple.quarantine "$keychain_path"
+  if ! grep -Eq '[[:space:]][1-9][0-9]* valid identities found$' <<<"$identity_output"; then
+    echo "No usable code-signing identity found in $keychain_path" >&2
+    printf '%s\n' "$identity_output" >&2
+    return 1
   fi
 }
