@@ -686,7 +686,12 @@ async fn run_control_stream(
         );
         feedback_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut feedback =
-            VideoFeedbackState::new(our_video_ssrc, negotiated_video.ssrc, video_call_id);
+            VideoFeedbackState::new(
+                our_video_ssrc,
+                negotiated_video.ssrc,
+                video_call_id,
+                std::time::Instant::now(),
+            );
         // The device sends RTP and RTCP from its own port, not the senderPort we
         // offered; RTCP sent to the offered port is silently dropped, so PLI/FIR
         // and receiver reports never arrive. Reply to wherever the video comes from.
@@ -1349,7 +1354,11 @@ struct VideoFeedbackState {
 }
 
 impl VideoFeedbackState {
-    fn new(our_ssrc: u32, media_ssrc: u32, cname: String) -> Self {
+    /// `started_at` counts as an outstanding keyframe request: if the first
+    /// IDR is lost before anything was assembled, no discontinuity is ever
+    /// reported, and without this the picture waits for the device's own
+    /// periodic keyframe.
+    fn new(our_ssrc: u32, media_ssrc: u32, cname: String, started_at: std::time::Instant) -> Self {
         Self {
             base_sequence_number: None,
             cname,
@@ -1359,7 +1368,7 @@ impl VideoFeedbackState {
             our_ssrc,
             received_packets: 0,
             previous_report: (0, 0),
-            pending_keyframe_request: None,
+            pending_keyframe_request: Some(started_at),
         }
     }
 
@@ -3675,6 +3684,32 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_that_never_produced_a_sync_sample_asks_for_one() {
+        let start = std::time::Instant::now();
+        let mut feedback = VideoFeedbackState::new(1, 2, "cname".into(), start);
+
+        assert_eq!(
+            feedback.keyframe_retry(start + Duration::from_secs(1)),
+            None
+        );
+        assert!(
+            feedback
+                .keyframe_retry(start + KEYFRAME_RETRY_INTERVAL)
+                .is_some(),
+            "a lost first IDR is requested again"
+        );
+
+        let mut synced = VideoFeedbackState::new(1, 2, "cname".into(), start);
+        let first_idr = VideoDatagramOutcome {
+            emitted_access_unit: true,
+            emitted_sync_access_unit: true,
+            ..Default::default()
+        };
+        assert!(synced.consume(&first_idr, start).is_empty());
+        assert_eq!(synced.keyframe_retry(start + KEYFRAME_RETRY_INTERVAL), None);
+    }
+
+    #[test]
     fn userspace_video_offer_and_feedback_remain_one_owned_protocol() {
         let our_ssrc = 0x1020_3040;
         let device_ssrc = 0x5060_7080;
@@ -3684,7 +3719,8 @@ mod tests {
         let negotiated_offer = parse_screen_video_answer(&offer).unwrap();
         assert_eq!(negotiated_offer.ssrc, our_ssrc);
 
-        let mut feedback = VideoFeedbackState::new(our_ssrc, device_ssrc, call_id.into());
+        let start = std::time::Instant::now();
+        let mut feedback = VideoFeedbackState::new(our_ssrc, device_ssrc, call_id.into(), start);
         let first = VideoDatagramOutcome {
             completed_frame_timestamps: vec![0xA0B0_C0D0],
             emitted_access_unit: true,
@@ -3692,7 +3728,6 @@ mod tests {
             requires_keyframe: false,
             ..Default::default()
         };
-        let start = std::time::Instant::now();
         assert!(
             feedback.consume(&first, start).is_empty(),
             "no per-frame ACK: it desyncs the encoder under motion"
