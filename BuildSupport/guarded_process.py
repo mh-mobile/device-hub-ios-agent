@@ -29,7 +29,9 @@ RESIDUAL_PROCESS_EXIT_STATUS = 125
 CLEANUP_FAILURE_EXIT_STATUS = 126
 LOCK_METADATA_MAXIMUM_BYTES = 4_096
 NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-PROCESS_INSPECTION_TIMEOUT_SECONDS = 2.0
+# ps normally answers in milliseconds, but booting a simulator can push the
+# load average past 200; a failed inspection fails the guarded command.
+PROCESS_INSPECTION_TIMEOUT_SECONDS = 15.0
 MAXIMUM_KILL_SWEEPS = 3
 WATCHDOG_NORMAL_COMPLETION_MESSAGE = b"device-hub-guard-complete-v1"
 PROCESS_STATUS_EXECUTABLES = (Path("/bin/ps"), Path("/usr/bin/ps"))

@@ -45,6 +45,22 @@ def different_group_descendant_program(identity_path: Path) -> str:
 
 
 class GuardedProcessTests(unittest.TestCase):
+    def test_session_inspection_tolerates_a_heavily_loaded_host(self) -> None:
+        # Booting a simulator can push the load average past 200, where ps
+        # takes seconds; a short limit failed the guard itself (status 126).
+        observed: list[float] = []
+        real_run = subprocess.run
+
+        def recording_run(*arguments, **keywords):
+            observed.append(keywords["timeout"])
+            return real_run(*arguments, **keywords)
+
+        with mock.patch.object(guarded_process.subprocess, "run", recording_run):
+            guarded_process.process_session_members(os.getsid(0))
+
+        self.assertTrue(observed)
+        self.assertGreaterEqual(min(observed), 10)
+
     def assert_different_group_same_session(self, identity_path: Path) -> int:
         """Validate the cross-process-group fixture and return its PID."""
 
