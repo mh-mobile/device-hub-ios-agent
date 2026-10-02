@@ -18,7 +18,15 @@ struct DeviceHubApp: App {
 
     @MainActor
     init() {
-        AgentHTTPServer.shared.start() // agents drive the shown device over HTTP (port 8765)
+        // Agents drive the shown device over HTTP (port 8765) only when a
+        // token is configured; see Config/Local.xcconfig.example.
+        AgentHTTPServer.shared.start(
+            policy: AgentAccessPolicy(
+                token: Bundle.main.object(
+                    forInfoDictionaryKey: "DeviceHubAgentToken"
+                ) as? String
+            )
+        )
         #if DEBUG
             switch DeviceHubDebugLaunchSelection(
                 arguments: ProcessInfo.processInfo.arguments

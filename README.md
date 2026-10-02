@@ -74,6 +74,23 @@ Available tasks:
 
 Run `mise tasks` for the full task list.
 
+## Agent HTTP API
+
+This fork can let an agent on another machine drive the device shown in Device
+Hub over HTTP on port 8765 (`/screen`, `/screenshot`, `/tap`, `/drag`, `/type`,
+`/button`). It is off by default. To enable it, set a token of at least 16
+characters in `Config/Local.xcconfig`:
+
+```
+DEVICE_HUB_AGENT_TOKEN = <output of: openssl rand -hex 24>
+```
+
+Requests must come from loopback or a Tailscale address (100.64.0.0/10,
+fd7a:115c:a1e0::/48) and send `Authorization: Bearer <token>`; other sources get
+403 and missing or wrong tokens get 401. `Tools/agent-mcp/device_hub_mcp.py` is a
+stdio MCP server for it; give it `DEVICE_HUB_URL` (the iPad's tailnet name) and
+`DEVICE_HUB_AGENT_TOKEN`.
+
 ## Project structure
 
 ```text

@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """MCP server (stdio) that drives a device shown in Device Hub on an iPad, over its agent HTTP API.
 
-Register with Claude Code:
-    claude mcp add device-hub -e DEVICE_HUB_URL=http://iPadPro.local:8765 -- python3 /path/to/device_hub_mcp.py
+Register with Claude Code (the iPad accepts only loopback and Tailscale peers, so use its
+tailnet name or 100.x address, and the token configured as DEVICE_HUB_AGENT_TOKEN in the app):
+    claude mcp add device-hub -e DEVICE_HUB_URL=http://ipad-pro:8765 \
+        -e DEVICE_HUB_AGENT_TOKEN=... -- python3 /path/to/device_hub_mcp.py
 
 Screenshots come back scaled to SHOT_HEIGHT pixels tall; tap and drag take coordinates in that
 image, so an agent can use what it sees as is. No third-party packages: macOS's `sips` scales.
 """
 import base64, json, os, subprocess, sys, tempfile, urllib.request
 
-URL = os.environ.get("DEVICE_HUB_URL", "http://iPadPro.local:8765").rstrip("/")
+URL = os.environ.get("DEVICE_HUB_URL", "http://ipad-pro:8765").rstrip("/")
+TOKEN = os.environ.get("DEVICE_HUB_AGENT_TOKEN", "")
 SHOT_HEIGHT = int(os.environ.get("DEVICE_HUB_SHOT_HEIGHT", "1000"))
 scale = None  # device pixels per screenshot pixel, from the latest screenshot
 
 
 def http(method, path, body=None, timeout=30):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(URL + path, data=data, method=method, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(URL + path, data=data, method=method, headers={"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()

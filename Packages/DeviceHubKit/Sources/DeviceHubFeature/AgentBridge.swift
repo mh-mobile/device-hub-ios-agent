@@ -50,17 +50,31 @@ public final class AgentBridge: @unchecked Sendable {
         try await send(.tap(TargetPixelPoint(x: x, y: y)))
     }
 
+    /// The longest drag an agent may request.
+    static let maximumDragDuration = 10.0
+
     /// A one-finger drag from start to end in `steps` moves over `duration` seconds.
     public func drag(from start: (Double, Double), to end: (Double, Double), duration: Double = 0.3, steps: Int = 12) async throws {
+        let steps = max(steps, 1)
+        let stepDuration = try Self.dragStepDuration(total: duration, steps: steps)
         let point = { (t: Double) in
             TargetPixelPoint(x: start.0 + (end.0 - start.0) * t, y: start.1 + (end.1 - start.1) * t)
         }
         try await send(.touch(TouchCommand(contactID: 0, point: point(0), phase: .began)))
-        for step in 1 ... max(steps, 1) {
-            try await Task.sleep(for: .seconds(duration / Double(max(steps, 1))))
-            try await send(.touch(TouchCommand(contactID: 0, point: point(Double(step) / Double(max(steps, 1))), phase: .moved)))
+        for step in 1 ... steps {
+            try await Task.sleep(for: stepDuration)
+            try await send(.touch(TouchCommand(contactID: 0, point: point(Double(step) / Double(steps)), phase: .moved)))
         }
         try await send(.touch(TouchCommand(contactID: 0, point: point(1), phase: .ended)))
+    }
+
+    /// Rejects a duration outside `0...maximumDragDuration` (including NaN and
+    /// infinity) before it reaches `Duration`, which traps on huge values.
+    static func dragStepDuration(total: Double, steps: Int) throws -> Duration {
+        guard total.isFinite, (0 ... maximumDragDuration).contains(total) else {
+            throw AgentBridgeError("duration must be between 0 and \(maximumDragDuration) seconds")
+        }
+        return .milliseconds((total * 1000 / Double(max(steps, 1))).rounded())
     }
 
     public func type(_ text: String) async throws {
