@@ -188,9 +188,36 @@ pub(crate) enum ControlCommand {
     ReleaseAllInput,
 }
 
+fn is_touch_move(command: &ControlCommand) -> bool {
+    matches!(command, ControlCommand::Touch(TouchIntent::Move { .. }))
+}
+
+/// Queues a command for the protocol task. A touch move that does not fit is
+/// dropped: a later move or the release supersedes it, and failing the
+/// session because a finger moved faster than HID delivery ended sessions
+/// during fast scrolling. Any other command that does not fit still fails.
+fn enqueue_on(
+    controls: &mpsc::Sender<ControlCommand>,
+    command: ControlCommand,
+    stage: &'static str,
+) -> Result<(), PublicFailure> {
+    match controls.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(command)) if is_touch_move(&command) => Ok(()),
+        Err(_) => Err(PublicFailure::new(
+            "control_queue_unavailable",
+            stage,
+            true,
+            "The bounded native control queue cannot accept this command.",
+        )),
+    }
+}
+
 /// Protocol-owned receive side and readiness gates for generation-safe control.
 pub(crate) struct ControlGate {
     receiver: mpsc::Receiver<ControlCommand>,
+    /// A command read ahead while collapsing moves, returned next.
+    stashed: Option<ControlCommand>,
     input_ready: Arc<AtomicBool>,
     video_control_ready: Arc<AtomicBool>,
     video_negotiation_pending: Arc<AtomicBool>,
@@ -201,8 +228,27 @@ impl ControlGate {
         self.input_ready.store(true, Ordering::Release);
     }
 
+    /// Returns the next command. Consecutive queued touch moves collapse to
+    /// the latest one: only the newest finger position matters, and replaying
+    /// every intermediate move kept the protocol task busy with HID writes
+    /// while video went unread. Down, up, cancel, and every other command keep
+    /// their order and are never dropped.
     pub(crate) async fn receive(&mut self) -> Option<ControlCommand> {
-        self.receiver.recv().await
+        let mut command = match self.stashed.take() {
+            Some(command) => command,
+            None => self.receiver.recv().await?,
+        };
+        while is_touch_move(&command) {
+            match self.receiver.try_recv() {
+                Ok(next) if is_touch_move(&next) => command = next,
+                Ok(next) => {
+                    self.stashed = Some(next);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        Some(command)
     }
 }
 
@@ -674,6 +720,7 @@ impl Session {
         let video_negotiation_pending = Arc::new(AtomicBool::new(false));
         let control_gate = ControlGate {
             receiver: control_receiver,
+            stashed: None,
             input_ready: Arc::clone(&input_ready),
             video_control_ready: Arc::clone(&video_control_ready),
             video_negotiation_pending: Arc::clone(&video_negotiation_pending),
@@ -1061,14 +1108,7 @@ impl Session {
         command: ControlCommand,
         stage: &'static str,
     ) -> Result<(), PublicFailure> {
-        self.controls.try_send(command).map_err(|_| {
-            PublicFailure::new(
-                "control_queue_unavailable",
-                stage,
-                true,
-                "The bounded native control queue cannot accept this command.",
-            )
-        })
+        enqueue_on(&self.controls, command, stage)
     }
 
     pub(crate) fn shutdown(&mut self) -> DhStatus {
@@ -1553,6 +1593,83 @@ mod tests {
         },
         time::Duration,
     };
+
+    fn touch_kind(command: &ControlCommand) -> Option<(&'static str, u16)> {
+        match command {
+            ControlCommand::Touch(TouchIntent::Down { x, .. }) => Some(("down", *x)),
+            ControlCommand::Touch(TouchIntent::Move { x, .. }) => Some(("move", *x)),
+            ControlCommand::Touch(TouchIntent::Up { x, .. }) => Some(("up", *x)),
+            _ => None,
+        }
+    }
+
+    fn test_gate(capacity: usize) -> (mpsc::Sender<ControlCommand>, ControlGate) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let gate = ControlGate {
+            receiver,
+            stashed: None,
+            input_ready: Arc::new(AtomicBool::new(true)),
+            video_control_ready: Arc::new(AtomicBool::new(true)),
+            video_negotiation_pending: Arc::new(AtomicBool::new(false)),
+        };
+        (sender, gate)
+    }
+
+    #[test]
+    fn queued_moves_collapse_to_the_latest_without_reordering_edges() {
+        let (sender, mut gate) = test_gate(16);
+        for command in [
+            TouchIntent::Down { x: 1, y: 0 },
+            TouchIntent::Move { x: 2, y: 0 },
+            TouchIntent::Move { x: 3, y: 0 },
+            TouchIntent::Move { x: 4, y: 0 },
+            TouchIntent::Up { x: 5, y: 0 },
+            TouchIntent::Move { x: 6, y: 0 },
+        ] {
+            sender.try_send(ControlCommand::Touch(command)).unwrap();
+        }
+        drop(sender);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let received = runtime.block_on(async {
+            let mut received = Vec::new();
+            while let Some(command) = gate.receive().await {
+                received.push(touch_kind(&command).unwrap());
+            }
+            received
+        });
+        assert_eq!(
+            received,
+            vec![("down", 1), ("move", 4), ("up", 5), ("move", 6)]
+        );
+    }
+
+    #[test]
+    fn a_full_queue_drops_a_move_but_rejects_an_edge() {
+        let (sender, _gate) = test_gate(1);
+        sender
+            .try_send(ControlCommand::Touch(TouchIntent::Down { x: 0, y: 0 }))
+            .unwrap();
+
+        assert!(
+            enqueue_on(
+                &sender,
+                ControlCommand::Touch(TouchIntent::Move { x: 1, y: 1 }),
+                "touch_input"
+            )
+            .is_ok(),
+            "a later move supersedes a dropped one"
+        );
+        assert!(
+            enqueue_on(
+                &sender,
+                ControlCommand::Touch(TouchIntent::Up { x: 1, y: 1 }),
+                "touch_input"
+            )
+            .is_err()
+        );
+    }
 
     use super::*;
 

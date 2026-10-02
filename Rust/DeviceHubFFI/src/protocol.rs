@@ -707,6 +707,38 @@ async fn run_control_stream(
                     let _ = changed;
                     break Ok(());
                 }
+                // Input before media: under heavy motion a video datagram is
+                // almost always ready, and with media first a queued touch
+                // waited behind the whole burst. Moves are collapsed when
+                // received, so input cannot hold the loop for long.
+                command = controls.receive() => {
+                    let Some(command) = command else {
+                        break Err(PublicFailure::new(
+                            "control_channel_closed",
+                            "control_stream",
+                            false,
+                            "The native control channel closed unexpectedly.",
+                        ));
+                    };
+                    let trace_label = input_trace_label(&command);
+                    if let Err(failure) = handle_control_command(
+                            command,
+                            &video_udp,
+                            video_peer_port,
+                            &mut universal_hid,
+                            keyboard_service_id,
+                            &mut indigo_hid,
+                            &mut orientation,
+                            &mut cleanup,
+                        )
+                        .await
+                    {
+                        break Err(failure);
+                    }
+                    if let Some(trace_label) = trace_label {
+                        input_trace("delivered", &trace_label);
+                    }
+                }
                 // Device audio: each RTP payload is one raw AAC-ELD frame. Handed to
                 // the controller through the datagram event, which the app plays.
                 datagram = audio_udp.recv(), if audio_open => {
@@ -788,34 +820,6 @@ async fn run_control_stream(
                         true,
                         "The authenticated display stream did not produce a complete video frame in time.",
                     ));
-                }
-                command = controls.receive() => {
-                    let Some(command) = command else {
-                        break Err(PublicFailure::new(
-                            "control_channel_closed",
-                            "control_stream",
-                            false,
-                            "The native control channel closed unexpectedly.",
-                        ));
-                    };
-                    let trace_label = input_trace_label(&command);
-                    if let Err(failure) = handle_control_command(
-                            command,
-                            &video_udp,
-                            video_peer_port,
-                            &mut universal_hid,
-                            keyboard_service_id,
-                            &mut indigo_hid,
-                            &mut orientation,
-                            &mut cleanup,
-                        )
-                        .await
-                    {
-                        break Err(failure);
-                    }
-                    if let Some(trace_label) = trace_label {
-                        input_trace("delivered", &trace_label);
-                    }
                 }
             }
         };
