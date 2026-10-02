@@ -4255,7 +4255,7 @@ index a75f1f58d4c7126dfa5c4cd5b2e33fdf18820916..c316db33ec92bde42eb6fca30d619e7f
  /// `negotiator_offer` is the zlib+protobuf blob
  /// from [`super::negotiation::MediaNegotiationBlob::to_negotiator_offer`].
 diff --git a/idevice/src/services/core_device/display_stream/hevc.rs b/idevice/src/services/core_device/display_stream/hevc.rs
-index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c979450b3483e 100644
+index f0e4dc29d5b42a3f2e8825807af104b8da071b27..0b2c6065cbb8a081cbf33db5c2f6def991cf60bc 100644
 --- a/idevice/src/services/core_device/display_stream/hevc.rs
 +++ b/idevice/src/services/core_device/display_stream/hevc.rs
 @@ -5,7 +5,9 @@
@@ -4514,7 +4514,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
      }
  
      /// Drain and return all Annex-B output accumulated so far.
-@@ -268,3 +288,2068 @@ fn seq_less_than(a: u16, b: u16) -> bool {
+@@ -268,3 +288,2138 @@ fn seq_less_than(a: u16, b: u16) -> bool {
      let diff = b.wrapping_sub(a);
      diff != 0 && diff < 0x8000
  }
@@ -5176,6 +5176,10 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +    reorder_bytes: usize,
 +    next_sequence_number: Option<u16>,
 +    requires_sync_sample: bool,
++    /// Timestamp of an access unit dropped after a loss or malformed payload.
++    /// Its remaining packets are discarded silently, so one loss produces one
++    /// discontinuity rather than one per orphaned fragment.
++    discarding_timestamp: Option<u32>,
 +    payload_assembler: PayloadAssembler,
 +    current: CurrentAccessUnit,
 +    video_parameter_set: Option<Vec<u8>>,
@@ -5209,6 +5213,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +            reorder_bytes: 0,
 +            next_sequence_number: None,
 +            requires_sync_sample: true,
++            discarding_timestamp: None,
 +            payload_assembler: PayloadAssembler::new(
 +                limits.max_nal_unit_size,
 +                limits.max_nal_unit_count,
@@ -5242,6 +5247,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +        self.reorder_bytes = 0;
 +        self.next_sequence_number = None;
 +        self.requires_sync_sample = true;
++        self.discarding_timestamp = None;
 +        self.payload_assembler.reset();
 +        self.current = CurrentAccessUnit::default();
 +        self.video_parameter_set = None;
@@ -5335,6 +5341,15 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +    }
 +
 +    fn consume_ordered(&mut self, packet: QueuedPacket) -> Vec<HevcDepacketizerEvent> {
++        if let Some(discarding) = self.discarding_timestamp {
++            if packet.timestamp == discarding {
++                if packet.marker {
++                    self.discarding_timestamp = None;
++                }
++                return Vec::new();
++            }
++            self.discarding_timestamp = None;
++        }
 +        let mut events = Vec::new();
 +        if let Some(timestamp) = self.current.timestamp
 +            && timestamp != packet.timestamp
@@ -5358,6 +5373,10 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +                events.push(HevcDepacketizerEvent::Discontinuity(discontinuity));
 +                self.drop_current_access_unit();
 +                self.requires_sync_sample = true;
++                if packet.marker {
++                    // The dropped access unit ended with this packet.
++                    self.discarding_timestamp = None;
++                }
 +                return events;
 +            }
 +        };
@@ -5369,6 +5388,9 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +                events.push(HevcDepacketizerEvent::Discontinuity(discontinuity));
 +                self.drop_current_access_unit();
 +                self.requires_sync_sample = true;
++                if packet.marker {
++                    self.discarding_timestamp = None;
++                }
 +                return events;
 +            }
 +        }
@@ -5383,6 +5405,8 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +            ));
 +            self.drop_current_access_unit();
 +            self.requires_sync_sample = true;
++            // This marker ended the dropped access unit.
++            self.discarding_timestamp = None;
 +            return events;
 +        }
 +        if let Some(event) = self.finish_access_unit() {
@@ -5504,6 +5528,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +    }
 +
 +    fn drop_current_access_unit(&mut self) {
++        self.discarding_timestamp = self.current.timestamp;
 +        self.payload_assembler.reset();
 +        self.current = CurrentAccessUnit::default();
 +    }
@@ -6222,6 +6247,51 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +
 +        let parameters = prime_parameter_sets(&mut assembler, 32);
 +        assert_eq!(parameters.revision, 1);
++    }
++
++    #[test]
++    fn one_lost_fragment_reports_one_discontinuity_for_its_access_unit() {
++        let mut assembler = HevcAccessUnitAssembler::new(PAYLOAD_TYPE, SSRC);
++        synchronize(&mut assembler, 40);
++        prime_parameter_sets(&mut assembler, 41);
++
++        // A large IDR split into FUs; the packet after the first is lost.
++        let fragments = MAX_REORDER_BUFFER + 20;
++        let mut discontinuities = 0;
++        let mut count = |events: Vec<HevcDepacketizerEvent>| {
++            discontinuities += events
++                .iter()
++                .filter(|event| matches!(event, HevcDepacketizerEvent::Discontinuity(_)))
++                .count();
++        };
++        count(push(
++            &mut assembler,
++            42,
++            10,
++            false,
++            &fu(19, true, false, &[1]),
++        ));
++        for index in 2..fragments {
++            let end = index == fragments - 1;
++            count(push(
++                &mut assembler,
++                42u16.wrapping_add(index as u16),
++                10,
++                end,
++                &fu(19, false, end, &[2]),
++            ));
++        }
++        assert_eq!(discontinuities, 1, "one loss is one discontinuity");
++
++        let recovered = nal(19, &[0xdd]);
++        let output = access_units(push(
++            &mut assembler,
++            42u16.wrapping_add(fragments as u16),
++            11,
++            true,
++            &recovered,
++        ));
++        assert_eq!(output.len(), 1, "the next sync sample is decoded");
 +    }
 +
 +    #[test]
