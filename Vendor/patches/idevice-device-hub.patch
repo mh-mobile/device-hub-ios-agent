@@ -7395,15 +7395,21 @@ index 2a8818e2a36493d4608ba1ff91266ac6a5e7acc7..c946b2604e4ce313265cbdfeedbe1b3e
 +    }
  }
 diff --git a/idevice/src/services/core_device/display_stream/rtcp.rs b/idevice/src/services/core_device/display_stream/rtcp.rs
-index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff45c44882 100644
+index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..87bb0c43b13a923b28e40e0daf1fab29a921e5ca 100644
 --- a/idevice/src/services/core_device/display_stream/rtcp.rs
 +++ b/idevice/src/services/core_device/display_stream/rtcp.rs
-@@ -18,7 +18,45 @@ const FMT_PLI: u8 = 1; // Picture Loss Indication
+@@ -17,8 +17,51 @@ pub const PT_PSFB: u8 = 206;
+ const FMT_PLI: u8 = 1; // Picture Loss Indication
  const FMT_FIR: u8 = 4; // Full Intra Request
  
++/// Whether a datagram on an RTP/RTCP-multiplexed port is RTCP.
++///
++/// Classification follows RFC 5761 (second byte 192..=223), not whether the
++/// packet is one this module can parse: extended reports or RTCP with odd
++/// padding must still be kept away from the RTP parser.
  pub fn is_rtcp(buf: &[u8]) -> bool {
 -    buf.len() >= 2 && (PT_SENDER_REPORT..=PT_PSFB).contains(&buf[1])
-+    rtcp_packet_length(buf, 0).is_some()
++    buf.len() >= 4 && buf[0] >> 6 == 2 && (192..=223).contains(&buf[1])
 +}
 +
 +fn rtcp_packet_length(buf: &[u8], offset: usize) -> Option<usize> {
@@ -7445,7 +7451,7 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
  }
  
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -36,13 +74,9 @@ impl SenderReport {
+@@ -36,13 +79,9 @@ impl SenderReport {
          // minus one.
          while off + 4 <= buf.len() {
              let pt = buf[off + 1];
@@ -7461,7 +7467,7 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
                  let ssrc =
                      u32::from_be_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
                  let ntp_msw =
-@@ -107,7 +141,10 @@ pub fn build_sdes(our_ssrc: u32, cname: &str) -> Vec<u8> {
+@@ -107,7 +146,10 @@ pub fn build_sdes(our_ssrc: u32, cname: &str) -> Vec<u8> {
      out.extend_from_slice(&our_ssrc.to_be_bytes());
      // CNAME item: type 1, length, text.
      let bytes = cname.as_bytes();
@@ -7473,7 +7479,7 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
      out.push(1);
      out.push(len as u8);
      out.extend_from_slice(&bytes[..len]);
-@@ -254,10 +291,9 @@ mod tests {
+@@ -254,10 +296,24 @@ mod tests {
          // RTP video (PT 100), marker clear and set.
          assert!(!is_rtcp(&[0x80, 100, 0, 0]));
          assert!(!is_rtcp(&[0x80, 0x80 | 100, 0, 0]));
@@ -7484,24 +7490,51 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
 +        // Complete RTCP RR / PSFB framing.
 +        assert!(is_rtcp(&build_receiver_report(1, &[])));
 +        assert!(is_rtcp(&build_pli(1, 2)));
++    }
++
++    #[test]
++    fn rtcp_types_this_parser_does_not_model_are_still_rtcp() {
++        // RFC 5761: in a multiplexed stream the second byte decides. Extended
++        // reports (207) and RTCP with unusable padding must never reach the
++        // RTP parser, where they would end the session.
++        assert!(is_rtcp(&[0x80, 207, 0x00, 0x01, 0, 0, 0, 1]));
++        assert!(is_rtcp(&[0xA0, 201, 0x00, 0x01, 0, 0, 0, 0]));
++        assert!(is_rtcp(&[0x80, 192, 0x00, 0x00]));
++        assert!(is_rtcp(&[0x80, 223, 0x00, 0x00]));
++        assert!(!is_rtcp(&[0x80, 191, 0x00, 0x00]));
++        assert!(!is_rtcp(&[0x80, 224, 0x00, 0x00]));
++        assert!(!is_rtcp(&[0x40, 207, 0x00, 0x00]), "not RTP version 2");
++        assert!(!is_rtcp(&[0x80, 207]), "shorter than a header");
      }
  
      #[test]
-@@ -372,4 +408,73 @@ mod tests {
+@@ -372,4 +428,85 @@ mod tests {
          // Middle 32 bits = low16(msw) << 16 | high16(lsw).
          assert_eq!(parsed.ntp_middle, 0x2222_3333);
      }
 +
 +    #[test]
 +    fn framing_checks_reject_wrong_version_truncation_and_impossible_lengths() {
++        // Classification only rejects non-version-2 packets; framing checks
++        // guard the parsers that read RTCP bodies.
 +        assert!(!is_rtcp(&[0x00, PT_SENDER_REPORT, 0, 0]));
-+        assert!(!is_rtcp(&[0x80, PT_SENDER_REPORT, 0, 6]));
-+        assert!(!is_rtcp(&[0x80, PT_RECEIVER_REPORT, 0, 0]));
-+        assert!(!is_rtcp(&[0x80, PT_APP, 0, 1, 0, 0, 0, 1]));
-+        assert!(!is_rtcp(&[0x80, 199, 0, 0]));
++        for truncated_or_impossible in [
++            &[0x80, PT_SENDER_REPORT, 0, 6][..],
++            &[0x80, PT_RECEIVER_REPORT, 0, 0][..],
++            &[0x80, PT_APP, 0, 1, 0, 0, 0, 1][..],
++            &[0x80, 199, 0, 0][..],
++        ] {
++            assert!(is_rtcp(truncated_or_impossible));
++            assert!(rtcp_packet_length(truncated_or_impossible, 0).is_none());
++        }
 +
-+        assert!(is_rtcp(&build_receiver_report(1, &[])));
-+        assert!(is_rtcp(&build_pli(1, 2)));
++        let receiver_report = build_receiver_report(1, &[]);
++        assert_eq!(
++            rtcp_packet_length(&receiver_report, 0),
++            Some(receiver_report.len())
++        );
++        let pli = build_pli(1, 2);
++        assert_eq!(rtcp_packet_length(&pli, 0), Some(pli.len()));
 +    }
 +
 +    #[test]
