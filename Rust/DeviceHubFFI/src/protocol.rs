@@ -1302,11 +1302,12 @@ struct PreparedVideoDatagram {
 }
 
 impl PreparedVideoDatagram {
-    /// Whether emitting these events will send a new video configuration,
-    /// which needs the device orientation. Mirrors emission order: a
-    /// discontinuity resets the emitted revision, so an access unit after it
-    /// re-sends its configuration.
-    fn has_new_configuration(&self, last_configuration_revision: u64) -> bool {
+    /// Whether emitting these events needs the current device orientation:
+    /// for a new video configuration, or for a sync sample, where a rotation
+    /// that kept identical parameter sets (a 180° turn) becomes visible.
+    /// Mirrors emission order: a discontinuity resets the emitted revision, so
+    /// an access unit after it re-sends its configuration.
+    fn needs_orientation(&self, last_configuration_revision: u64) -> bool {
         let mut revision = last_configuration_revision;
         self.events.iter().any(|event| match event {
             HevcDepacketizerEvent::Discontinuity(_) => {
@@ -1314,7 +1315,7 @@ impl PreparedVideoDatagram {
                 false
             }
             HevcDepacketizerEvent::AccessUnit(access_unit) => {
-                access_unit.parameter_set_revision > revision
+                access_unit.is_sync || access_unit.parameter_set_revision > revision
             }
             HevcDepacketizerEvent::PacketRejected(_) => false,
         })
@@ -1486,19 +1487,19 @@ async fn process_live_video_datagram(
     else {
         return Ok(VideoDatagramOutcome::default());
     };
-    let authoritative_orientation =
-        if prepared.has_new_configuration(video.last_configuration_revision) {
-            Some(
-                stage(
-                    INPUT_TIMEOUT,
-                    orientation_state_failed(),
-                    orientation.current_orientation(),
-                )
-                .await?,
+    let authoritative_orientation = if prepared.needs_orientation(video.last_configuration_revision)
+    {
+        Some(
+            stage(
+                INPUT_TIMEOUT,
+                orientation_state_failed(),
+                orientation.current_orientation(),
             )
-        } else {
-            None
-        };
+            .await?,
+        )
+    } else {
+        None
+    };
     emit_prepared_video_datagram(
         prepared,
         &video.assembler,
@@ -1623,6 +1624,14 @@ fn emit_prepared_video_datagram(
                     let concrete_orientation = concrete_orientation_from_raw(geometry.orientation)?;
                     media.video_configuration(configuration, concrete_orientation)?;
                     emit_display_geometry_if_complete(emitter, *geometry)?;
+                } else if access_unit.is_sync
+                    && let Some(orientation) = authoritative_orientation
+                {
+                    let previous = geometry.orientation;
+                    update_geometry_orientation(geometry, orientation)?;
+                    if geometry.orientation != previous {
+                        emit_display_geometry_if_complete(emitter, *geometry)?;
+                    }
                 }
                 media.video_access_unit(access_unit, *geometry)?;
                 outcome.completed_frame_timestamps.push(rtp_timestamp);
@@ -1687,7 +1696,7 @@ fn process_video_datagram_outcome(
         return Ok(VideoDatagramOutcome::default());
     };
     let orientation = prepared
-        .has_new_configuration(*last_configuration_revision)
+        .needs_orientation(*last_configuration_revision)
         .then(|| test_orientation_state(*geometry))
         .transpose()?;
     emit_prepared_video_datagram(
@@ -2842,6 +2851,63 @@ mod tests {
             .await
             .map_err(|_| "RSD handshake timed out".to_owned())?
             .map_err(|error| format!("RSD handshake failed: {error}"))
+    }
+
+    #[test]
+    fn a_sync_sample_applies_the_current_orientation_without_new_parameter_sets() {
+        // Turning a landscape device 180° can keep identical parameter sets, so
+        // orientation cannot depend on a new configuration revision.
+        let capture = ProtocolMediaCapture::default();
+        let media = test_media_emitter(&capture);
+        let control = EventEmitterTestFixture::new();
+        let emitter = control.emitter();
+        let mut assembler = HevcAccessUnitAssembler::new(TEST_VIDEO_PAYLOAD_TYPE, TEST_VIDEO_SSRC);
+        let mut last_configuration_revision = 0;
+        let mut geometry = test_geometry();
+        prime_test_video_stream(
+            &mut assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            &media,
+            &emitter,
+        );
+        capture.events.lock().unwrap().clear();
+
+        let prepared = prepare_video_datagram(
+            test_rtp_datagram(TEST_VIDEO_PAYLOAD_TYPE, 4, 4, true, &test_nal(19, &[0xF1])),
+            VIDEO_SENDER_PORT,
+            &mut assembler,
+            &mut last_configuration_revision,
+            &media,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(prepared.needs_orientation(last_configuration_revision));
+        let mut flipped = geometry;
+        flipped.orientation = DhOrientation::PortraitUpsideDown as u32;
+        flipped.non_flat_orientation = DhOrientation::PortraitUpsideDown as u32;
+        let orientation = test_orientation_state(flipped).unwrap();
+        emit_prepared_video_datagram(
+            prepared,
+            &assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            Some(&orientation),
+            &media,
+            &emitter,
+        )
+        .unwrap();
+
+        let events = capture.events.lock().unwrap();
+        let access_unit_geometry = events.last().unwrap().1.unwrap();
+        assert_eq!(
+            access_unit_geometry.orientation,
+            DhOrientation::PortraitUpsideDown as u32
+        );
+        assert_eq!(
+            geometry.orientation,
+            DhOrientation::PortraitUpsideDown as u32
+        );
     }
 
     #[test]
