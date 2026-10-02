@@ -1294,13 +1294,21 @@ struct PreparedVideoDatagram {
 }
 
 impl PreparedVideoDatagram {
+    /// Whether emitting these events will send a new video configuration,
+    /// which needs the device orientation. Mirrors emission order: a
+    /// discontinuity resets the emitted revision, so an access unit after it
+    /// re-sends its configuration.
     fn has_new_configuration(&self, last_configuration_revision: u64) -> bool {
-        self.events.iter().any(|event| {
-            matches!(
-                event,
-                HevcDepacketizerEvent::AccessUnit(access_unit)
-                    if access_unit.parameter_set_revision > last_configuration_revision
-            )
+        let mut revision = last_configuration_revision;
+        self.events.iter().any(|event| match event {
+            HevcDepacketizerEvent::Discontinuity(_) => {
+                revision = 0;
+                false
+            }
+            HevcDepacketizerEvent::AccessUnit(access_unit) => {
+                access_unit.parameter_set_revision > revision
+            }
+            HevcDepacketizerEvent::PacketRejected(_) => false,
         })
     }
 }
@@ -1568,7 +1576,12 @@ fn emit_prepared_video_datagram(
         match event {
             HevcDepacketizerEvent::AccessUnit(access_unit) => {
                 let rtp_timestamp = access_unit.rtp_timestamp;
-                outcome.emitted_sync_access_unit |= access_unit.is_sync;
+                if access_unit.is_sync {
+                    // A sync sample after an earlier discontinuity in this
+                    // batch already recovered the picture.
+                    outcome.emitted_sync_access_unit = true;
+                    outcome.requires_keyframe = false;
+                }
                 if access_unit.parameter_set_revision > *last_configuration_revision {
                     let orientation =
                         authoritative_orientation.ok_or_else(orientation_state_failed)?;
@@ -1618,6 +1631,28 @@ fn process_video_datagram(
     media: &MediaEmitter,
     emitter: &EventEmitter,
 ) -> Result<bool, PublicFailure> {
+    Ok(process_video_datagram_outcome(
+        bytes,
+        source_port,
+        assembler,
+        last_configuration_revision,
+        geometry,
+        media,
+        emitter,
+    )?
+    .emitted_access_unit)
+}
+
+#[cfg(test)]
+fn process_video_datagram_outcome(
+    bytes: Vec<u8>,
+    source_port: u16,
+    assembler: &mut HevcAccessUnitAssembler,
+    last_configuration_revision: &mut u64,
+    geometry: &mut DhDisplayGeometry,
+    media: &MediaEmitter,
+    emitter: &EventEmitter,
+) -> Result<VideoDatagramOutcome, PublicFailure> {
     let Some(prepared) = prepare_video_datagram(
         bytes,
         source_port,
@@ -1626,13 +1661,13 @@ fn process_video_datagram(
         media,
     )?
     else {
-        return Ok(false);
+        return Ok(VideoDatagramOutcome::default());
     };
     let orientation = prepared
         .has_new_configuration(*last_configuration_revision)
         .then(|| test_orientation_state(*geometry))
         .transpose()?;
-    Ok(emit_prepared_video_datagram(
+    emit_prepared_video_datagram(
         prepared,
         assembler,
         last_configuration_revision,
@@ -1640,8 +1675,7 @@ fn process_video_datagram(
         orientation.as_ref(),
         media,
         emitter,
-    )?
-    .emitted_access_unit)
+    )
 }
 
 #[cfg(test)]
@@ -2785,6 +2819,57 @@ mod tests {
             .await
             .map_err(|_| "RSD handshake timed out".to_owned())?
             .map_err(|error| format!("RSD handshake failed: {error}"))
+    }
+
+    #[test]
+    fn a_sync_sample_after_a_gap_in_the_same_batch_needs_no_keyframe_request() {
+        let capture = ProtocolMediaCapture::default();
+        let media = test_media_emitter(&capture);
+        let control = EventEmitterTestFixture::new();
+        let emitter = control.emitter();
+        let mut assembler = HevcAccessUnitAssembler::new(TEST_VIDEO_PAYLOAD_TYPE, TEST_VIDEO_SSRC);
+        let mut last_configuration_revision = 0;
+        let mut geometry = test_geometry();
+        prime_test_video_stream(
+            &mut assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            &media,
+            &emitter,
+        );
+
+        // Sequence 4 is lost; the IDR at 5 is drained together with the gap.
+        let mut outcome = VideoDatagramOutcome::default();
+        for (sequence, payload) in [
+            (5u16, test_nal(19, &[0xF0])),
+            (6, test_nal(1, &[0x61])),
+            (7, test_nal(1, &[0x62])),
+        ] {
+            let next = process_video_datagram_outcome(
+                test_rtp_datagram(
+                    TEST_VIDEO_PAYLOAD_TYPE,
+                    sequence,
+                    u32::from(sequence),
+                    true,
+                    &payload,
+                ),
+                VIDEO_SENDER_PORT,
+                &mut assembler,
+                &mut last_configuration_revision,
+                &mut geometry,
+                &media,
+                &emitter,
+            )
+            .unwrap();
+            outcome.emitted_sync_access_unit |= next.emitted_sync_access_unit;
+            outcome.requires_keyframe = next.requires_keyframe
+                || (outcome.requires_keyframe && !next.emitted_sync_access_unit);
+        }
+        assert!(outcome.emitted_sync_access_unit, "the IDR was decoded");
+        assert!(
+            !outcome.requires_keyframe,
+            "the IDR after the gap already recovered the picture"
+        );
     }
 
     #[test]
