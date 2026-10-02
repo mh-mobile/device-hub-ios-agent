@@ -13,14 +13,14 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
         category: "audio"
     )
     private static let audioSpecificConfig = Data([0xF8, 0xE8, 0x50, 0x00])
-    /// Frames queued but not yet played, in 480-sample (~11 ms) buffers. Packets
-    /// arrive in bursts after network hiccups; past this the newest audio is
-    /// dropped instead of queued, so latency cannot build up.
-    // ponytail: fixed cap; raise it if steady streams start dropping audio.
-    private static let maximumQueuedBuffers = 16
-    /// After running dry, wait for this many buffers (~55 ms) before resuming, so
-    /// network jitter becomes one short gap instead of constant stutter.
-    private static let resumeThreshold = 5
+    /// Frames queued but not yet played, in 480-sample (~11 ms) buffers. Audio
+    /// shares the TCP tunnel with video, so it stalls and then arrives in bursts
+    /// of up to ~1 s; past this cap (~400 ms) the newest audio is dropped so
+    /// latency cannot build up. A balance between delay and dropouts.
+    private static let maximumQueuedBuffers = 36
+    /// After running dry, wait for this many buffers (~150 ms) before resuming, so
+    /// a stall becomes one short gap instead of constant stutter.
+    private static let resumeThreshold = 14
 
     private let queue = DispatchQueue(label: "DeviceHub.audio")
     private let engine = AVAudioEngine()
@@ -135,9 +135,15 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
             output.frameLength > 0,
             queuedBuffers < Self.maximumQueuedBuffers
         else {
+            if queuedBuffers >= Self.maximumQueuedBuffers {
+                DeviceHubNativeTrace.emit("audio overflow_drop queued=\(queuedBuffers)")
+            }
             return
         }
         if queuedBuffers == 0 {
+            if held.isEmpty {
+                DeviceHubNativeTrace.emit("audio underrun packet=\(packets)")
+            }
             held.append(output)
             guard held.count >= Self.resumeThreshold else {
                 return

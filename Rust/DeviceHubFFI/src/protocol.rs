@@ -666,6 +666,7 @@ async fn run_control_stream(
         };
         update_geometry_orientation(&mut video.geometry, &initial_orientation)?;
         let mut audio_open = true;
+        let mut last_audio_sequence: Option<u16> = None;
         let mut cleanup = InputCleanupState::default();
         let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
         tokio::pin!(first_video_frame_deadline);
@@ -696,6 +697,13 @@ async fn run_control_stream(
                     match datagram {
                         Ok(datagram) if !is_rtcp(&datagram.data) => {
                             if let Ok(packet) = RtpPacket::parse_checked(&datagram.data) {
+                                if let Some(last) = last_audio_sequence
+                                    && packet.sequence_number != last.wrapping_add(1)
+                                {
+                                    let lost = packet.sequence_number.wrapping_sub(last).wrapping_sub(1);
+                                    input_trace("audio", &format!("gap lost={lost}"));
+                                }
+                                last_audio_sequence = Some(packet.sequence_number);
                                 let _ = media.video_datagram(
                                     packet.payload.to_vec(),
                                     datagram.source_port,
