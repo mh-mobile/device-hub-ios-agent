@@ -184,7 +184,6 @@ public extension RemoteSessionFeature {
         )
         case startViewingButtonTapped
         case stopViewingButtonTapped
-        case tap(point: Point2D, viewport: Viewport)
         case task
         case touch(
             contactID: UInt8,

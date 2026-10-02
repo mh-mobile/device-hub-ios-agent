@@ -1,3 +1,6 @@
+import ComposableArchitecture
+import DeviceHubClient
+import DeviceHubCore
 @testable import DeviceHubFeature
 import Foundation
 import Testing
@@ -157,5 +160,49 @@ struct AgentDragTimingTests {
         #expect(throws: AgentBridgeError.self) {
             try AgentBridge.dragStepDuration(total: .infinity, steps: 12)
         }
+    }
+}
+
+@Suite("Agent drag cleanup")
+struct AgentDragCleanupTests {
+    @Test("a drag that fails midway lifts the finger instead of leaving it down")
+    func failedDragCancelsTheTouch() async throws {
+        let recorded = LockIsolated<[DeviceCommand]>([])
+        let target = device(id: "agent", name: "Test iPhone")
+        let session = DeviceSession(
+            id: DeviceSessionID(rawValue: fixtureUUID(95)),
+            device: target,
+            events: AsyncThrowingStream { $0.finish() },
+            frames: AsyncStream { $0.finish() },
+            command: { command in
+                recorded.withValue { $0.append(command) }
+                if recorded.value.count == 3 {
+                    throw DeviceHubError.connectionLost
+                }
+            },
+            disconnect: {}
+        )
+        let bridge = AgentBridge()
+        try bridge.update(
+            session: session,
+            frame: remoteFrame(
+                generation: SessionGeneration(rawValue: fixtureUUID(96)),
+                receivedAt: Date(timeIntervalSince1970: 0),
+                sequenceNumber: 1
+            )
+        )
+
+        await #expect(throws: DeviceHubError.self) {
+            try await bridge.drag(from: (10, 10), to: (50, 50), duration: 0, steps: 4)
+        }
+
+        let phases = recorded.value.compactMap { command -> TouchPhase? in
+            guard case let .touch(touch) = command else {
+                return nil
+            }
+            return touch.phase
+        }
+        #expect(phases.first == .began)
+        #expect(phases.last == .cancelled)
     }
 }

@@ -80,24 +80,6 @@ extension RemoteSessionFeature {
                 state: &state
             )
 
-        case let .tap(point, viewport):
-            DeviceHubFeatureTrace.emit(.touchTap)
-            guard let session = state.session,
-                  let metadata = session.frame?.metadata,
-                  let mappedPoint = RemoteCoordinateMapper.mapInitialTouch(
-                      point,
-                      in: viewport,
-                      targetPixels: metadata.pixelSize,
-                      orientation: metadata.orientation
-                  )
-            else {
-                return .none
-            }
-            return sendCommandIfAllowed(
-                .tap(mappedPoint),
-                state: &state
-            )
-
         case let .touch(contactID, phase, point, viewport):
             return handleTouch(
                 state: &state,

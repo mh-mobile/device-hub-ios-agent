@@ -16,7 +16,6 @@ struct RemoteCanvas: View {
     let remediationButtonTapped: () -> Void
     let remediationDismissed: () -> Void
     let startViewingButtonTapped: () -> Void
-    let tap: (Point2D, Viewport) -> Void
     let touch: (UInt8, TouchPhase, Point2D, Viewport) -> Void
 
     @State private var touchLedger = RemoteTouchLedger()
@@ -152,7 +151,6 @@ struct RemoteCanvas: View {
                 RemoteInputSurface(
                     touchLedger: $touchLedger,
                     acceptsInput: acceptsInput,
-                    tap: tap,
                     touch: touch
                 )
             }
@@ -200,6 +198,13 @@ struct RemoteCanvas: View {
     }
 }
 
+struct RemoteTouchEvent: Equatable {
+    let contactID: UInt8
+    let phase: TouchPhase
+    let point: Point2D
+    let viewport: Viewport
+}
+
 struct RemoteActiveTouch: Equatable {
     let contactID: UInt8
     var lastPoint: Point2D
@@ -210,26 +215,62 @@ struct RemoteActiveTouch: Equatable {
 struct RemoteTouchLedger {
     private(set) var activeTouch: RemoteActiveTouch?
 
-    /// Starts a contact only when no gesture is currently owned.
-    mutating func beginIfNeeded(
+    /// Reports a finger at `point`: the first report puts it down on the
+    /// device at once (so holding is a long press), later ones move it.
+    mutating func touchChanged(
         contactID: UInt8,
         at point: Point2D,
         viewport: Viewport
-    ) -> RemoteActiveTouch? {
-        guard activeTouch == nil else {
-            return nil
+    ) -> RemoteTouchEvent {
+        guard var touch = activeTouch else {
+            activeTouch = RemoteActiveTouch(
+                contactID: contactID,
+                lastPoint: point,
+                viewport: viewport
+            )
+            return RemoteTouchEvent(
+                contactID: contactID,
+                phase: .began,
+                point: point,
+                viewport: viewport
+            )
         }
-        let touch = RemoteActiveTouch(
-            contactID: contactID,
-            lastPoint: point,
-            viewport: viewport
-        )
+        touch.lastPoint = point
         activeTouch = touch
-        return touch
+        return RemoteTouchEvent(
+            contactID: touch.contactID,
+            phase: .moved,
+            point: point,
+            viewport: touch.viewport
+        )
     }
 
-    mutating func updateLastPoint(_ point: Point2D) {
-        activeTouch?.lastPoint = point
+    /// Lifts the finger where the gesture ended.
+    mutating func touchEnded(at point: Point2D) -> RemoteTouchEvent? {
+        guard let touch = removeActiveTouch() else {
+            return nil
+        }
+        return RemoteTouchEvent(
+            contactID: touch.contactID,
+            phase: .ended,
+            point: point,
+            viewport: touch.viewport
+        )
+    }
+
+    /// Called when the gesture's state resets. If it did not end normally
+    /// (iOS cancelled it for a system gesture or interruption), the remote
+    /// finger would otherwise stay down; cancel it at its last position.
+    mutating func gestureReset() -> RemoteTouchEvent? {
+        guard let touch = removeActiveTouch() else {
+            return nil
+        }
+        return RemoteTouchEvent(
+            contactID: touch.contactID,
+            phase: .cancelled,
+            point: touch.lastPoint,
+            viewport: touch.viewport
+        )
     }
 
     /// Ends local ownership and returns the contact to terminate remotely.
@@ -308,7 +349,6 @@ private struct RemoteInputSurface: View {
     @Binding var touchLedger: RemoteTouchLedger
 
     let acceptsInput: Bool
-    let tap: (Point2D, Viewport) -> Void
     let touch: (UInt8, TouchPhase, Point2D, Viewport) -> Void
 
     var body: some View {
@@ -322,7 +362,6 @@ private struct RemoteInputSurface: View {
                         viewport: RemoteInputSurfaceGeometry.viewport(
                             for: geometry.size
                         ),
-                        tap: tap,
                         touch: touch
                     )
                 )
@@ -333,63 +372,54 @@ private struct RemoteInputSurface: View {
 
 private struct RemoteInputModifier: ViewModifier {
     @Binding var touchLedger: RemoteTouchLedger
+    @GestureState private var isTouching = false
 
     let acceptsInput: Bool
     let viewport: Viewport
-    let tap: (Point2D, Viewport) -> Void
     let touch: (UInt8, TouchPhase, Point2D, Viewport) -> Void
 
     func body(content: Content) -> some View {
         if acceptsInput {
             content
-                .simultaneousGesture(tapGesture)
-                .simultaneousGesture(dragGesture)
+                .gesture(touchGesture)
+                .onChange(of: isTouching) { _, isTouching in
+                    guard !isTouching else {
+                        return
+                    }
+                    // A gesture that ended normally already lifted the finger
+                    // in onEnded; check after it so only a cancellation is left.
+                    DispatchQueue.main.async {
+                        send(touchLedger.gestureReset())
+                    }
+                }
         } else {
             content
         }
     }
 
-    private var tapGesture: some Gesture {
-        SpatialTapGesture()
+    /// One finger, reported from the moment it touches the canvas.
+    private var touchGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .updating($isTouching) { _, isTouching, _ in
+                isTouching = true
+            }
+            .onChanged { value in
+                send(touchLedger.touchChanged(
+                    contactID: 0,
+                    at: value.location.point2D,
+                    viewport: viewport
+                ))
+            }
             .onEnded { value in
-                tap(value.location.point2D, viewport)
+                send(touchLedger.touchEnded(at: value.location.point2D))
             }
     }
 
-    private var dragGesture: some Gesture {
-        DragGesture(minimumDistance: 8)
-            .onChanged { value in
-                let startPoint = value.startLocation.point2D
-                if let activeTouch = touchLedger.beginIfNeeded(
-                    contactID: 0,
-                    at: startPoint,
-                    viewport: viewport
-                ) {
-                    touch(
-                        activeTouch.contactID,
-                        .began,
-                        activeTouch.lastPoint,
-                        activeTouch.viewport
-                    )
-                }
-
-                let point = value.location.point2D
-                touchLedger.updateLastPoint(point)
-                touch(0, .moved, point, viewport)
-            }
-            .onEnded { value in
-                guard let activeTouch = touchLedger.removeActiveTouch()
-                else {
-                    return
-                }
-                let point = value.location.point2D
-                touch(
-                    activeTouch.contactID,
-                    .ended,
-                    point,
-                    activeTouch.viewport
-                )
-            }
+    private func send(_ event: RemoteTouchEvent?) {
+        guard let event else {
+            return
+        }
+        touch(event.contactID, event.phase, event.point, event.viewport)
     }
 }
 

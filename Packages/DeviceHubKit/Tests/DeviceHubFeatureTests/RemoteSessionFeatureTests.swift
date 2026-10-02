@@ -177,7 +177,9 @@ struct RemoteSessionFeatureTests {
 
         await store.send(.rotateRightButtonTapped)
         await store.send(
-            .tap(
+            .touch(
+                contactID: 0,
+                phase: .began,
                 point: Point2D(x: 50, y: 100),
                 viewport: Viewport(
                     origin: Point2D(x: 0, y: 0),
@@ -237,26 +239,44 @@ struct RemoteSessionFeatureTests {
         await store.receive(\.commandFinished)
         #expect(store.state.session?.frame?.metadata.orientation == .portrait)
 
-        await store.send(
-            .tap(
-                point: Point2D(x: 150, y: 100),
-                viewport: Viewport(
-                    origin: Point2D(x: 0, y: 0),
-                    size: Size2D(width: 200, height: 400)
-                )
-            )
+        let viewport = Viewport(
+            origin: Point2D(x: 0, y: 0),
+            size: Size2D(width: 200, height: 400)
         )
+        await store.send(
+            .touch(
+                contactID: 0,
+                phase: .began,
+                point: Point2D(x: 150, y: 100),
+                viewport: viewport
+            )
+        ) {
+            $0.activeContactIDs = [0]
+        }
         await recorder.waitForCommandCount(2)
-        let commandsAfterTap = await recorder.commands()
-        #expect(commandsAfterTap.count == 2)
+        await store.receive(\.commandFinished)
+        await store.send(
+            .touch(
+                contactID: 0,
+                phase: .ended,
+                point: Point2D(x: 150, y: 100),
+                viewport: viewport
+            )
+        ) {
+            $0.activeContactIDs = []
+        }
+        await recorder.waitForCommandCount(3)
+        await store.receive(\.commandFinished)
+        let point = TargetPixelPoint(x: 74.25, y: 49.75)
+        let recordedCommands = await recorder.commands()
         expectNoDifference(
-            commandsAfterTap,
+            recordedCommands,
             [
-                .rotation(.rotateRight),
-                .tap(TargetPixelPoint(x: 74.25, y: 49.75))
+                DeviceCommand.rotation(.rotateRight),
+                .touch(TouchCommand(contactID: 0, point: point, phase: .began)),
+                .touch(TouchCommand(contactID: 0, point: point, phase: .ended))
             ]
         )
-        await store.receive(\.commandFinished)
 
         await store.send(.stopViewingButtonTapped) {
             $0.isViewingStopped = true

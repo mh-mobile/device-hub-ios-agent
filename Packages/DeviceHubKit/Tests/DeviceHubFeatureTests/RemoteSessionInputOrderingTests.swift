@@ -10,15 +10,6 @@ import Testing
 @MainActor
 @Suite("Remote session input ordering")
 struct RemoteSessionInputOrderingTests {
-    @Test("Touch trace milestones never contain screen coordinates")
-    func touchTraceMilestonesAreCoordinateFree() {
-        let message = DeviceHubFeatureTrace.Milestone.touchTap.message
-
-        #expect(message == "input_geometry kind=touch_tap")
-        #expect(!message.contains("123.456"))
-        #expect(!message.contains("789.012"))
-    }
-
     @Test("Semantic taps remain one command while transport is suspended")
     func semanticTapsRemainAtomicWhenTransportIsSuspended() async throws {
         let fixture = AtomicInputFixture()

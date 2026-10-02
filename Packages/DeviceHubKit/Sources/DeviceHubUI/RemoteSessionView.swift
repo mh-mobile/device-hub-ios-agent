@@ -89,7 +89,6 @@ struct RemoteSessionView: View {
                 remediationButtonTapped: remediationButtonTapped,
                 remediationDismissed: remediationDismissed,
                 startViewingButtonTapped: startViewingButtonTapped,
-                tap: tap,
                 touch: touch
             )
             .id(store.selectedDeviceID)
@@ -322,13 +321,6 @@ struct RemoteSessionView: View {
     private func stopViewingButtonTapped() {
         isKeyboardPresented = false
         store.send(.stopViewingButtonTapped)
-    }
-
-    private func tap(
-        _ point: Point2D,
-        _ viewport: Viewport
-    ) {
-        store.send(.tap(point: point, viewport: viewport))
     }
 
     private func touch(

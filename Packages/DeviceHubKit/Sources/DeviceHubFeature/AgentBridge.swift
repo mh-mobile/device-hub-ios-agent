@@ -61,11 +61,19 @@ public final class AgentBridge: @unchecked Sendable {
             TargetPixelPoint(x: start.0 + (end.0 - start.0) * t, y: start.1 + (end.1 - start.1) * t)
         }
         try await send(.touch(TouchCommand(contactID: 0, point: point(0), phase: .began)))
-        for step in 1 ... steps {
-            try await Task.sleep(for: stepDuration)
-            try await send(.touch(TouchCommand(contactID: 0, point: point(Double(step) / Double(steps)), phase: .moved)))
+        var last = point(0)
+        do {
+            for step in 1 ... steps {
+                try await Task.sleep(for: stepDuration)
+                last = point(Double(step) / Double(steps))
+                try await send(.touch(TouchCommand(contactID: 0, point: last, phase: .moved)))
+            }
+            try await send(.touch(TouchCommand(contactID: 0, point: point(1), phase: .ended)))
+        } catch {
+            // The finger is down on the device; lift it before reporting.
+            try? await send(.touch(TouchCommand(contactID: 0, point: last, phase: .cancelled)))
+            throw error
         }
-        try await send(.touch(TouchCommand(contactID: 0, point: point(1), phase: .ended)))
     }
 
     /// Rejects a duration outside `0...maximumDragDuration` (including NaN and

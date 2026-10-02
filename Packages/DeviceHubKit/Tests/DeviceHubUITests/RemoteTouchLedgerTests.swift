@@ -110,13 +110,18 @@ struct RemoteTouchLedgerTests {
         )
         var ledger = RemoteTouchLedger()
 
-        let firstContact = ledger.beginIfNeeded(
+        let firstContact = ledger.touchChanged(
             contactID: 0,
             at: Point2D(x: 40, y: 80),
             viewport: viewport
         )
-        let requiredFirstContact = try #require(firstContact)
-        ledger.updateLastPoint(Point2D(x: 120, y: 240))
+        let requiredFirstContact = try #require(ledger.activeTouch)
+        #expect(firstContact.phase == .began)
+        _ = ledger.touchChanged(
+            contactID: 0,
+            at: Point2D(x: 120, y: 240),
+            viewport: viewport
+        )
 
         let cancelledContact = ledger.revokeInput(from: true, to: false)
         let requiredCancelledContact = try #require(cancelledContact)
@@ -130,14 +135,13 @@ struct RemoteTouchLedgerTests {
         )
         #expect(ledger.activeTouch == nil)
 
-        let reauthorizedContact = ledger.beginIfNeeded(
+        let reauthorizedContact = ledger.touchChanged(
             contactID: 0,
             at: Point2D(x: 60, y: 100),
             viewport: viewport
         )
-        let requiredReauthorizedContact = try #require(
-            reauthorizedContact
-        )
+        #expect(reauthorizedContact.phase == .began)
+        let requiredReauthorizedContact = try #require(ledger.activeTouch)
         #expect(
             requiredReauthorizedContact.lastPoint
                 == Point2D(x: 60, y: 100)
@@ -152,16 +156,52 @@ struct RemoteTouchLedgerTests {
             size: Size2D(width: 390, height: 844)
         )
         var ledger = RemoteTouchLedger()
-        let contact = ledger.beginIfNeeded(
+        _ = ledger.touchChanged(
             contactID: 0,
             at: Point2D(x: 20, y: 30),
             viewport: viewport
         )
-        let requiredContact = try #require(contact)
+        let requiredContact = try #require(ledger.activeTouch)
 
         #expect(ledger.revokeInput(from: true, to: true) == nil)
         #expect(ledger.activeTouch == requiredContact)
         #expect(ledger.revokeInput(from: false, to: true) == nil)
         #expect(ledger.activeTouch == requiredContact)
+    }
+
+    @Test("the finger goes down when it touches, so a hold is a long press")
+    func touchDownIsImmediate() {
+        let viewport = Viewport(
+            origin: Point2D(x: 0, y: 0),
+            size: Size2D(width: 390, height: 844)
+        )
+        var ledger = RemoteTouchLedger()
+
+        let down = ledger.touchChanged(contactID: 0, at: Point2D(x: 10, y: 20), viewport: viewport)
+        #expect(down == RemoteTouchEvent(contactID: 0, phase: .began, point: Point2D(x: 10, y: 20), viewport: viewport))
+        let move = ledger.touchChanged(contactID: 0, at: Point2D(x: 11, y: 22), viewport: viewport)
+        #expect(move.phase == .moved)
+        let up = ledger.touchEnded(at: Point2D(x: 12, y: 24))
+        #expect(up == RemoteTouchEvent(contactID: 0, phase: .ended, point: Point2D(x: 12, y: 24), viewport: viewport))
+        #expect(ledger.activeTouch == nil)
+        #expect(ledger.gestureReset() == nil, "a completed touch is not cancelled again")
+    }
+
+    @Test("a gesture the system cancels lifts the remote finger once")
+    func systemCancellationLiftsTheFinger() {
+        let viewport = Viewport(
+            origin: Point2D(x: 0, y: 0),
+            size: Size2D(width: 390, height: 844)
+        )
+        var ledger = RemoteTouchLedger()
+        _ = ledger.touchChanged(contactID: 0, at: Point2D(x: 10, y: 20), viewport: viewport)
+        _ = ledger.touchChanged(contactID: 0, at: Point2D(x: 30, y: 40), viewport: viewport)
+
+        let cancelled = ledger.gestureReset()
+        #expect(cancelled == RemoteTouchEvent(contactID: 0, phase: .cancelled, point: Point2D(x: 30, y: 40), viewport: viewport))
+        #expect(ledger.gestureReset() == nil)
+        #expect(ledger.touchEnded(at: Point2D(x: 31, y: 41)) == nil)
+        let next = ledger.touchChanged(contactID: 0, at: Point2D(x: 50, y: 60), viewport: viewport)
+        #expect(next.phase == .began, "the next drag starts with a fresh touch-down")
     }
 }
