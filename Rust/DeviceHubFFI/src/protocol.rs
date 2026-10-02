@@ -703,8 +703,8 @@ async fn run_control_stream(
                 // the controller through the datagram event, which the app plays.
                 datagram = audio_udp.recv(), if audio_open => {
                     match datagram {
-                        Ok(datagram) if !is_rtcp(&datagram.data) => {
-                            if let Ok(packet) = RtpPacket::parse_checked(&datagram.data) {
+                        Ok(datagram) => {
+                            if let Some(packet) = audio_rtp_packet(&datagram.data) {
                                 if let Some(last) = last_audio_sequence
                                     && packet.sequence_number != last.wrapping_add(1)
                                 {
@@ -718,7 +718,6 @@ async fn run_control_stream(
                                 );
                             }
                         }
-                        Ok(_) => {}
                         Err(_) => audio_open = false,
                     }
                 }
@@ -1943,6 +1942,20 @@ const fn orientation_state_failed() -> PublicFailure {
     )
 }
 
+/// The RTP packet of an audio datagram worth forwarding, or `None`.
+///
+/// Media datagram events must carry at least one byte (the Swift decoder fails
+/// the whole session otherwise), so RTCP, malformed packets, and header-only or
+/// padding-only RTP are dropped here instead of reaching the controller.
+fn audio_rtp_packet(datagram: &[u8]) -> Option<RtpPacket<'_>> {
+    if is_rtcp(datagram) {
+        return None;
+    }
+    RtpPacket::parse_checked(datagram)
+        .ok()
+        .filter(|packet| !packet.payload.is_empty())
+}
+
 /// Whether an established video stream has gone silent for too long.
 fn video_stream_stalled(last_datagram: std::time::Instant, now: std::time::Instant) -> bool {
     now.saturating_duration_since(last_datagram) >= MEDIA_STALL_TIMEOUT
@@ -2491,6 +2504,30 @@ fn event_failure_as_idevice(_: PublicFailure) -> idevice::IdeviceError {
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, ffi::c_void, sync::Mutex};
+
+    #[test]
+    fn only_audio_rtp_with_a_payload_is_forwarded() {
+        let header = [0x80, 0x60, 0x00, 0x01, 0, 0, 0, 1, 0, 0, 0, 2];
+        let mut with_payload = header.to_vec();
+        with_payload.extend_from_slice(&[0xAB, 0xCD]);
+        assert_eq!(
+            audio_rtp_packet(&with_payload).map(|packet| packet.payload.to_vec()),
+            Some(vec![0xAB, 0xCD])
+        );
+        assert!(audio_rtp_packet(&header).is_none(), "header-only RTP");
+        let mut padding_only = header.to_vec();
+        padding_only[0] |= 0x20;
+        padding_only.extend_from_slice(&[0, 0, 0, 4]);
+        assert!(
+            audio_rtp_packet(&padding_only).is_none(),
+            "padding-only RTP"
+        );
+        assert!(
+            audio_rtp_packet(&[0x81, 0xC9, 0x00, 0x01, 0, 0, 0, 1]).is_none(),
+            "RTCP"
+        );
+        assert!(audio_rtp_packet(&[0x80]).is_none(), "truncated");
+    }
 
     #[test]
     fn a_silent_video_socket_stalls_only_after_the_timeout() {
