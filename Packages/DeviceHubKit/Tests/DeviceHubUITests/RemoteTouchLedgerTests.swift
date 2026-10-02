@@ -204,4 +204,20 @@ struct RemoteTouchLedgerTests {
         let next = ledger.touchChanged(contactID: 0, at: Point2D(x: 50, y: 60), viewport: viewport)
         #expect(next.phase == .began, "the next drag starts with a fresh touch-down")
     }
+
+    @Test("a late cancellation check never cancels a newer touch")
+    func lateCancellationIgnoresANewerTouch() throws {
+        let viewport = Viewport(
+            origin: Point2D(x: 0, y: 0),
+            size: Size2D(width: 390, height: 844)
+        )
+        var ledger = RemoteTouchLedger()
+        _ = ledger.touchChanged(contactID: 0, at: Point2D(x: 1, y: 1), viewport: viewport)
+        let observed = try #require(ledger.activeTouch?.generation)
+        _ = ledger.touchEnded(at: Point2D(x: 1, y: 1))
+        _ = ledger.touchChanged(contactID: 0, at: Point2D(x: 2, y: 2), viewport: viewport)
+
+        #expect(ledger.gestureReset(generation: observed) == nil)
+        #expect(ledger.activeTouch != nil, "the newer touch stays down")
+    }
 }

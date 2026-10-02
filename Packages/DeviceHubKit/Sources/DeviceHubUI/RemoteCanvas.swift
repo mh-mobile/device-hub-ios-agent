@@ -207,6 +207,9 @@ struct RemoteTouchEvent: Equatable {
 
 struct RemoteActiveTouch: Equatable {
     let contactID: UInt8
+    /// Distinguishes successive touches so a late cancellation check can
+    /// only ever cancel the touch it observed.
+    var generation: UInt64 = 0
     var lastPoint: Point2D
     let viewport: Viewport
 }
@@ -214,6 +217,7 @@ struct RemoteActiveTouch: Equatable {
 /// Local gesture ownership that cannot outlive remote input authorization.
 struct RemoteTouchLedger {
     private(set) var activeTouch: RemoteActiveTouch?
+    private var nextGeneration: UInt64 = 0
 
     /// Reports a finger at `point`: the first report puts it down on the
     /// device at once (so holding is a long press), later ones move it.
@@ -223,8 +227,10 @@ struct RemoteTouchLedger {
         viewport: Viewport
     ) -> RemoteTouchEvent {
         guard var touch = activeTouch else {
+            nextGeneration &+= 1
             activeTouch = RemoteActiveTouch(
                 contactID: contactID,
+                generation: nextGeneration,
                 lastPoint: point,
                 viewport: viewport
             )
@@ -261,8 +267,10 @@ struct RemoteTouchLedger {
     /// Called when the gesture's state resets. If it did not end normally
     /// (iOS cancelled it for a system gesture or interruption), the remote
     /// finger would otherwise stay down; cancel it at its last position.
-    mutating func gestureReset() -> RemoteTouchEvent? {
-        guard let touch = removeActiveTouch() else {
+    mutating func gestureReset(generation: UInt64? = nil) -> RemoteTouchEvent? {
+        guard generation == nil || activeTouch?.generation == generation,
+              let touch = removeActiveTouch()
+        else {
             return nil
         }
         return RemoteTouchEvent(
@@ -383,13 +391,16 @@ private struct RemoteInputModifier: ViewModifier {
             content
                 .gesture(touchGesture)
                 .onChange(of: isTouching) { _, isTouching in
-                    guard !isTouching else {
+                    guard !isTouching,
+                          let generation = touchLedger.activeTouch?.generation
+                    else {
                         return
                     }
                     // A gesture that ended normally already lifted the finger
-                    // in onEnded; check after it so only a cancellation is left.
+                    // in onEnded; check after it so only a cancellation of
+                    // this same touch is left.
                     DispatchQueue.main.async {
-                        send(touchLedger.gestureReset())
+                        send(touchLedger.gestureReset(generation: generation))
                     }
                 }
         } else {
