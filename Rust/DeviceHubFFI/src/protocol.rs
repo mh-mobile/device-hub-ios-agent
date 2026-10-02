@@ -3571,10 +3571,19 @@ mod tests {
             "the wraparound is extended and the skipped packet is reported lost"
         );
 
-        assert_eq!(feedback.keyframe_retry(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            feedback.keyframe_retry(start + Duration::from_secs(2)),
+            None
+        );
         assert_eq!(
             feedback.keyframe_retry(start + KEYFRAME_RETRY_INTERVAL),
-            Some(build_keyframe_request(our_ssrc, call_id, device_ssrc, &[], 1)),
+            Some(build_keyframe_request(
+                our_ssrc,
+                call_id,
+                device_ssrc,
+                &[],
+                1
+            )),
             "an ignored keyframe request is repeated"
         );
         let synced = VideoDatagramOutcome {
