@@ -7,7 +7,9 @@ import subprocess
 from pathlib import Path
 from typing import Iterable
 
-DEFAULT_BASE_REFERENCES = ("@{upstream}", "origin/HEAD", "origin/main", "main")
+# The default branch, never the branch's own upstream: for a pushed feature
+# branch the upstream is HEAD, which would hide every pushed commit.
+DEFAULT_BASE_REFERENCES = ("origin/HEAD", "origin/main", "main")
 
 
 def is_documentation_only(paths: Iterable[str] | None) -> bool:
@@ -61,7 +63,9 @@ def changed_paths(repository: Path) -> set[str] | None:
     base = _merge_base(repository)
     if base is None:
         return None
-    paths = _git_lines(repository, "diff", "--name-only", base)
+    # --no-renames lists a renamed file's old path too, so moving source into
+    # Docs/ is not mistaken for a documentation change.
+    paths = _git_lines(repository, "diff", "--name-only", "--no-renames", base)
     paths |= _git_lines(repository, "ls-files", "--others", "--exclude-standard")
     return paths
 

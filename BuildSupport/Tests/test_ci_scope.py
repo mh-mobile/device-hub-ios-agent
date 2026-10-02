@@ -52,6 +52,28 @@ class CIScopeTests(unittest.TestCase):
             self.assertIn("App.swift", changed_paths(repository))
             self.assertFalse(is_documentation_only(changed_paths(repository)))
 
+    def test_pushed_branch_still_compares_against_the_default_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = self.make_pushed_repository(Path(directory))
+            self.run_git(repository, "switch", "-c", "feature")
+            (repository / "App.swift").write_text("let changed = 1\n")
+            self.run_git(repository, "commit", "-am", "Change source")
+            self.run_git(repository, "push", "-u", "origin", "feature")
+            (repository / "Notes.md").write_text("Untracked\n")
+
+            self.assertIn("App.swift", changed_paths(repository))
+            self.assertFalse(is_documentation_only(changed_paths(repository)))
+
+    def test_source_renamed_into_docs_is_not_documentation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = self.make_pushed_repository(Path(directory))
+            (repository / "Docs").mkdir()
+            self.run_git(repository, "mv", "App.swift", "Docs/App.md")
+            self.run_git(repository, "commit", "-m", "Move source")
+
+            self.assertIn("App.swift", changed_paths(repository))
+            self.assertFalse(is_documentation_only(changed_paths(repository)))
+
     def test_deleted_source_is_not_documentation(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = self.make_pushed_repository(Path(directory))
