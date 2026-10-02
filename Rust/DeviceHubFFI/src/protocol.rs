@@ -64,6 +64,9 @@ const VIDEO_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 // The device often ignores a lone PLI/FIR, and without a retry the picture stays
 // frozen until its own periodic keyframe (up to a minute). Re-ask until one lands.
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+// Losses close together each report a discontinuity; one request per second
+// is enough, and the retry above covers a request the device ignored.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 // The device keeps sending RTCP sender reports while the screen is static, so a
 // silent video socket means the path is gone (airplane mode, lost access point).
 // Without this the session stayed "Live" until the kernel's TCP timeout.
@@ -1351,6 +1354,7 @@ struct VideoFeedbackState {
     previous_report: (u32, u32),
     // When the last keyframe request went out, while no sync frame has arrived since.
     pending_keyframe_request: Option<std::time::Instant>,
+    last_keyframe_request_sent: Option<std::time::Instant>,
 }
 
 impl VideoFeedbackState {
@@ -1369,6 +1373,7 @@ impl VideoFeedbackState {
             received_packets: 0,
             previous_report: (0, 0),
             pending_keyframe_request: Some(started_at),
+            last_keyframe_request_sent: None,
         }
     }
 
@@ -1384,7 +1389,15 @@ impl VideoFeedbackState {
             self.pending_keyframe_request = None;
         }
         if outcome.requires_keyframe {
-            datagrams.push(self.keyframe_request(now));
+            let recently_sent = self.last_keyframe_request_sent.is_some_and(|sent| {
+                now.saturating_duration_since(sent) < KEYFRAME_REQUEST_MIN_INTERVAL
+            });
+            if recently_sent {
+                // Still outstanding; keyframe_retry re-sends it if ignored.
+                self.pending_keyframe_request.get_or_insert(now);
+            } else {
+                datagrams.push(self.keyframe_request(now));
+            }
         }
         datagrams
     }
@@ -1398,6 +1411,7 @@ impl VideoFeedbackState {
     fn keyframe_request(&mut self, now: std::time::Instant) -> Vec<u8> {
         input_trace("video", "keyframe_request");
         self.pending_keyframe_request = Some(now);
+        self.last_keyframe_request_sent = Some(now);
         let request = build_keyframe_request(
             self.our_ssrc,
             &self.cname,
@@ -3681,6 +3695,30 @@ mod tests {
 
         assert_eq!(negotiated.ssrc, 3);
         assert_eq!(negotiated.payload_type, 100);
+    }
+
+    #[test]
+    fn keyframe_requests_for_losses_close_together_are_coalesced() {
+        let start = std::time::Instant::now();
+        let mut feedback = VideoFeedbackState::new(1, 2, "cname".into(), start);
+        let loss = VideoDatagramOutcome {
+            requires_keyframe: true,
+            ..Default::default()
+        };
+
+        assert_eq!(feedback.consume(&loss, start).len(), 1);
+        assert!(
+            feedback
+                .consume(&loss, start + Duration::from_millis(200))
+                .is_empty(),
+            "a second loss within a second shares the outstanding request"
+        );
+        assert_eq!(
+            feedback
+                .consume(&loss, start + KEYFRAME_REQUEST_MIN_INTERVAL)
+                .len(),
+            1
+        );
     }
 
     #[test]
