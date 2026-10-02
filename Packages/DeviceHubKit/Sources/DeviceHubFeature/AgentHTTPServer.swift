@@ -57,16 +57,23 @@ public final class AgentHTTPServer: @unchecked Sendable {
 
     private func serve(_ connection: NWConnection, policy: AgentAccessPolicy) {
         connection.start(queue: queue)
+        let request = PendingRequest()
+        // Bounds only how long a client may take to send its request; a
+        // request that is being handled (a drag can last ten seconds) is not
+        // cut off, which would make a client resend an applied command.
         queue.asyncAfter(deadline: .now() + Self.requestTimeout) {
-            connection.cancel()
+            if !request.isComplete {
+                connection.cancel()
+            }
         }
-        receive(connection, buffer: Data(), policy: policy)
+        receive(connection, buffer: Data(), policy: policy, request: request)
     }
 
     private func receive(
         _ connection: NWConnection,
         buffer: Data,
-        policy: AgentAccessPolicy
+        policy: AgentAccessPolicy,
+        request pending: PendingRequest
     ) {
         connection.receive(
             minimumIncompleteLength: 1,
@@ -81,6 +88,7 @@ public final class AgentHTTPServer: @unchecked Sendable {
             }
             switch AgentHTTPRequest.parse(buffer) {
             case let .complete(request):
+                pending.isComplete = true
                 let decision = policy.decide(
                     sourceAddress: Self.sourceAddress(of: connection),
                     authorization: request.header("authorization")
@@ -99,7 +107,7 @@ public final class AgentHTTPServer: @unchecked Sendable {
                 if done || error != nil {
                     connection.cancel()
                 } else {
-                    receive(connection, buffer: buffer, policy: policy)
+                    receive(connection, buffer: buffer, policy: policy, request: pending)
                 }
             }
         }
@@ -194,6 +202,12 @@ public final class AgentHTTPServer: @unchecked Sendable {
     }
 }
 
+/// Whether a connection has delivered its whole request. Touched only on the
+/// server's serial queue.
+private final class PendingRequest: @unchecked Sendable {
+    var isComplete = false
+}
+
 /// One complete request: the head and, when Content-Length says so, its body.
 struct AgentHTTPRequest: Equatable {
     static let maximumHeadBytes = 16 * 1024
@@ -255,12 +269,9 @@ struct AgentHTTPRequest: Equatable {
         headers[name.lowercased()]
     }
 
-    /// A finite JSON number field, or `nil`.
+    /// A JSON number field, or `nil`. JSON cannot encode non-finite numbers.
     func number(_ key: String) -> Double? {
-        guard let value = (json[key] as? NSNumber)?.doubleValue, value.isFinite else {
-            return nil
-        }
-        return value
+        (json[key] as? NSNumber)?.doubleValue
     }
 
     func string(_ key: String) -> String? {

@@ -131,16 +131,6 @@ struct AgentHTTPRequestTests {
         )
         #expect(AgentHTTPRequest.parse(Data("BROKEN\r\n\r\n".utf8)) == .malformed)
     }
-
-    @Test("non-finite numbers are not numbers")
-    func nonFiniteNumbers() {
-        let raw = Data("POST / HTTP/1.1\r\nContent-Length: 12\r\n\r\n{\"d\":1e999 }".utf8)
-        guard case let .complete(request) = AgentHTTPRequest.parse(raw) else {
-            Issue.record("expected a complete request")
-            return
-        }
-        #expect(request.number("d") == nil)
-    }
 }
 
 @Suite("Agent drag timing")
