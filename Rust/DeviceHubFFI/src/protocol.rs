@@ -4,7 +4,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -658,22 +661,22 @@ async fn run_control_stream(
         )
         .await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        // Shared with the input loop, which rotates; video queries it.
-        let orientation = tokio::sync::Mutex::new(orientation);
-        // HID writes and tap holds run in their own loop, polled alongside
-        // video below, so a slow HID round trip or a held button never stops
-        // video datagrams from being read.
+        // Shared with the input task, which rotates; video queries it.
+        let orientation = Arc::new(tokio::sync::Mutex::new(orientation));
+        // HID writes and tap holds run in their own task, so a slow HID round
+        // trip or a held button never stops video datagrams from being read,
+        // and video waiting on the orientation lock never stops the rotation
+        // that holds it.
         let (input_commands, input_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let input_stopping = AtomicBool::new(false);
-        let input_loop = run_input_loop(
+        let input_stopping = Arc::new(AtomicBool::new(false));
+        let mut input_task = tokio::spawn(run_input_loop(
             input_receiver,
-            &input_stopping,
+            Arc::clone(&input_stopping),
             universal_hid,
             keyboard_service_id,
             indigo_hid,
-            &orientation,
-        );
-        tokio::pin!(input_loop);
+            Arc::clone(&orientation),
+        ));
         let mut input_finished = false;
         controls.enable_input();
         emitter.input_ready()?;
@@ -756,14 +759,34 @@ async fn run_control_stream(
                         }
                     }
                 }
-                result = &mut input_loop, if !input_finished => {
+                result = &mut input_task, if !input_finished => {
                     input_finished = true;
-                    break Err(result.err().unwrap_or_else(|| PublicFailure::new(
-                        "control_channel_closed",
-                        "control_stream",
-                        false,
-                        "The native input loop ended unexpectedly.",
-                    )));
+                    break Err(match result {
+                        Ok(Err(failure)) => failure,
+                        Ok(Ok(())) | Err(_) => PublicFailure::new(
+                            "control_channel_closed",
+                            "control_stream",
+                            false,
+                            "The native input loop ended unexpectedly.",
+                        ),
+                    });
+                }
+                // Ahead of the media sockets: under a constant datagram flood
+                // the biased select would otherwise never reach the receiver
+                // reports or the stall check.
+                _ = feedback_timer.tick() => {
+                    let now = std::time::Instant::now();
+                    if has_emitted_video_access_unit
+                        && video_stream_stalled(last_video_datagram, now)
+                    {
+                        break Err(media_stalled());
+                    }
+                    let retry = feedback.keyframe_retry(now);
+                    for datagram in feedback.periodic_report().into_iter().chain(retry) {
+                        if video_udp.send_to(video_peer_port, datagram).await.is_err() {
+                            break 'stream Err(video_control_delivery_failed());
+                        }
+                    }
                 }
                 // Device audio: each RTP payload is one raw AAC-ELD frame. Handed to
                 // the controller through the datagram event, which the app plays.
@@ -825,20 +848,6 @@ async fn run_control_stream(
                         }
                     }
                 }
-                _ = feedback_timer.tick() => {
-                    let now = std::time::Instant::now();
-                    if has_emitted_video_access_unit
-                        && video_stream_stalled(last_video_datagram, now)
-                    {
-                        break Err(media_stalled());
-                    }
-                    let retry = feedback.keyframe_retry(now);
-                    for datagram in feedback.periodic_report().into_iter().chain(retry) {
-                        if video_udp.send_to(video_peer_port, datagram).await.is_err() {
-                            break 'stream Err(video_control_delivery_failed());
-                        }
-                    }
-                }
                 () = &mut first_video_frame_deadline, if !has_emitted_video_access_unit => {
                     break Err(PublicFailure::new(
                         "video_stream_start_timed_out",
@@ -854,8 +863,12 @@ async fn run_control_stream(
         // still held before the media stream is stopped.
         input_stopping.store(true, Ordering::Release);
         drop(input_commands);
-        if !input_finished {
-            let _ = tokio::time::timeout(INPUT_TIMEOUT + INPUT_CLEANUP_TIMEOUT, input_loop).await;
+        if !input_finished
+            && tokio::time::timeout(INPUT_TIMEOUT + INPUT_CLEANUP_TIMEOUT, &mut input_task)
+                .await
+                .is_err()
+        {
+            input_task.abort();
         }
         result
     }
@@ -1151,6 +1164,28 @@ async fn handle_keyboard_intent_with_sink(
     Ok(())
 }
 
+/// Reads the orientation for a sync access unit, best effort.
+///
+/// If rotation holds the client longer than `lock_timeout`, the last
+/// orientation is kept. Once a request is sent its answer must be read
+/// (answers are not matched to requests), so a query that does not answer
+/// within `answer_timeout` ends the session instead of misaligning every
+/// later answer.
+async fn refresh_orientation<C, T, E>(
+    client: &tokio::sync::Mutex<C>,
+    lock_timeout: Duration,
+    answer_timeout: Duration,
+    query: impl AsyncFnOnce(&mut C) -> Result<T, E>,
+) -> Result<Option<T>, PublicFailure> {
+    let Ok(mut client) = tokio::time::timeout(lock_timeout, client.lock()).await else {
+        return Ok(None);
+    };
+    match tokio::time::timeout(answer_timeout, query(&mut client)).await {
+        Ok(answer) => Ok(answer.ok()),
+        Err(_) => Err(orientation_state_failed()),
+    }
+}
+
 trait HardwareButtonSink {
     async fn send(&mut self, button: HardwareButton, state: ButtonState) -> Result<(), HidError>;
 }
@@ -1170,7 +1205,9 @@ fn hardware_button_tap_hold(button: HardwareButton) -> Duration {
     }
 }
 
-impl HardwareButtonSink for IndigoHidClient<Box<dyn idevice::ReadWrite>> {
+// Generic over the object lifetime: inside the spawned input task the
+// compiler cannot prove the client's `dyn` is `'static` for every borrow.
+impl<'a> HardwareButtonSink for IndigoHidClient<Box<dyn idevice::ReadWrite + 'a>> {
     async fn send(&mut self, button: HardwareButton, state: ButtonState) -> Result<(), HidError> {
         self.send_hardware_button(button, state).await
     }
@@ -1233,11 +1270,11 @@ fn remove_last_button(buttons: &mut Vec<HardwareButton>, button: HardwareButton)
 /// moves collapse to the latest, and held inputs are released on exit.
 async fn run_input_loop(
     mut commands: tokio::sync::mpsc::UnboundedReceiver<ControlCommand>,
-    stopping: &AtomicBool,
+    stopping: Arc<AtomicBool>,
     mut universal_hid: UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
     keyboard_service_id: u64,
     mut indigo_hid: IndigoHidClient<Box<dyn idevice::ReadWrite>>,
-    orientation: &tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>,
+    orientation: Arc<tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>>,
 ) -> Result<(), PublicFailure> {
     let mut cleanup = InputCleanupState::default();
     let mut stashed = None;
@@ -1254,17 +1291,31 @@ async fn run_input_loop(
         }
         let command = collapse_moves(command, || commands.try_recv().ok(), &mut stashed);
         let trace_label = input_trace_label(&command);
-        if let Err(failure) = handle_input_command(
-            command,
-            &mut universal_hid,
-            keyboard_service_id,
-            &mut indigo_hid,
-            orientation,
-            &mut cleanup,
+        // A HID call that never answers fails the session instead of silently
+        // swallowing every later input while video keeps playing.
+        match tokio::time::timeout(
+            INPUT_TIMEOUT,
+            handle_input_command(
+                command,
+                &mut universal_hid,
+                keyboard_service_id,
+                &mut indigo_hid,
+                &orientation,
+                &mut cleanup,
+            ),
         )
         .await
         {
-            break Err(failure);
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => break Err(failure),
+            Err(_) => {
+                break Err(PublicFailure::new(
+                    "input_delivery_failed",
+                    "input",
+                    true,
+                    "A native input command did not complete in time.",
+                ));
+            }
         }
         if let Some(trace_label) = trace_label {
             input_trace("delivered", &trace_label);
@@ -1596,15 +1647,13 @@ async fn process_live_video_datagram(
                 .await?,
             )
         } else if prepared.has_sync_access_unit() {
-            // Best effort: a slow or failed refresh keeps the last orientation
-            // rather than stalling video or ending the session.
-            stage(
+            refresh_orientation(
+                orientation,
                 ORIENTATION_REFRESH_TIMEOUT,
-                orientation_state_failed(),
-                async { orientation.lock().await.current_orientation().await },
+                INPUT_TIMEOUT,
+                async |client| client.current_orientation().await,
             )
-            .await
-            .ok()
+            .await?
         } else {
             None
         };
@@ -3486,6 +3535,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![DhEventKind::VideoAccessUnit]
         );
+    }
+
+    #[tokio::test]
+    async fn orientation_refresh_skips_a_client_held_by_rotation() {
+        let client = tokio::sync::Mutex::new(());
+        let _rotation = client.lock().await;
+
+        let refreshed = refresh_orientation(
+            &client,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(1),
+        )
+        .await;
+
+        assert_eq!(refreshed.ok(), Some(None));
+    }
+
+    #[tokio::test]
+    async fn orientation_refresh_ends_the_session_when_a_sent_query_never_answers() {
+        let client = tokio::sync::Mutex::new(());
+
+        let refreshed = refresh_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            async |_: &mut ()| std::future::pending::<Result<u8, ()>>().await,
+        )
+        .await;
+
+        assert_eq!(
+            refreshed.err().map(|failure| failure.code),
+            Some(orientation_state_failed().code)
+        );
+    }
+
+    #[tokio::test]
+    async fn orientation_refresh_keeps_the_last_state_after_a_failed_answer() {
+        let client = tokio::sync::Mutex::new(());
+
+        let failed = refresh_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            async |_: &mut ()| Err::<u8, ()>(()),
+        )
+        .await;
+        let answered = refresh_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(3),
+        )
+        .await;
+
+        assert_eq!(failed.ok(), Some(None));
+        assert_eq!(answered.ok(), Some(Some(3)));
     }
 
     #[tokio::test]
