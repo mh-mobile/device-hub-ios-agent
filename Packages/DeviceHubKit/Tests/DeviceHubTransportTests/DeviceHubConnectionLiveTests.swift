@@ -30,14 +30,14 @@ struct DeviceHubConnectionLiveTests {
             verifyRemotePairing: { _ in }
         )
 
-        let didVerify = await verifyRemotePairingCandidate(
+        let outcome = await verifyRemotePairingCandidate(
             deviceID: record.deviceID,
             service: service,
             nativeSessions: native,
             pairingPersistence: persistence.client
         )
 
-        #expect(didVerify)
+        #expect(outcome == .verified)
         #expect(await operations.values.filter { $0 == .committed }.count == 1)
     }
 
@@ -69,15 +69,51 @@ struct DeviceHubConnectionLiveTests {
             }
         )
 
-        let didVerify = await verifyRemotePairingCandidate(
+        let outcome = await verifyRemotePairingCandidate(
             deviceID: record.deviceID,
             service: service,
             nativeSessions: native,
             pairingPersistence: persistence.client
         )
 
-        #expect(!didVerify)
+        #expect(outcome == .rejected)
         #expect(await operations.values.allSatisfy { $0 != .committed })
+    }
+
+    @Test("a Pair Verify that timed out is unreachable, not rejected")
+    func timedOutPairVerifyIsUnreachable() async throws {
+        let operations = OperationProbe()
+        let record = try fixtureRecord()
+        let persistence = try PersistenceProbe(
+            records: [record],
+            operations: operations
+        )
+        let service = try fixtureRemoteService(for: record)
+        let native = NativeSessionClient(
+            capabilities: [.pairVerifyDiscovery],
+            makePairingSession: { _ async throws(NativeSessionFailure) in
+                throw unavailableNativeSessionFailure
+            },
+            makeRemoteSession: { _ async throws(NativeSessionFailure) in
+                throw unavailableNativeSessionFailure
+            },
+            verifyRemotePairing: { _ async throws(NativeSessionFailure) in
+                throw NativeSessionFailure(
+                    code: "pair_verify_failed",
+                    stage: "pair_verify_timeout",
+                    retryable: true
+                )
+            }
+        )
+
+        let outcome = await verifyRemotePairingCandidate(
+            deviceID: record.deviceID,
+            service: service,
+            nativeSessions: native,
+            pairingPersistence: persistence.client
+        )
+
+        #expect(outcome == .unreachable)
     }
 
     @Test("a live session owns availability until disconnect")

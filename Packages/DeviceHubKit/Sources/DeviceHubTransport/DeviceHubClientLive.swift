@@ -163,9 +163,9 @@ func verifyRemotePairingCandidate(
     service: ValidatedRemotePairingService,
     nativeSessions: NativeSessionClient,
     pairingPersistence: PairingPersistenceClient
-) async -> Bool {
+) async -> CandidateVerificationOutcome {
     guard !Task.isCancelled else {
-        return false
+        return .rejected
     }
 
     var hintMatched = false
@@ -174,7 +174,7 @@ func verifyRemotePairingCandidate(
         guard let record = records.first(where: {
             $0.deviceID == deviceID
         }) else {
-            return false
+            return .rejected
         }
         let expectedTag = RemotePairingAuthTag.compute(
             alternateIRK: record.peerAlternateIRK.withUnsafeBytes { Data($0) },
@@ -182,7 +182,7 @@ func verifyRemotePairingCandidate(
         )
         hintMatched = service.authTags.contains(expectedTag)
         guard hintMatched else {
-            return false
+            return .rejected
         }
         let request = try await NativeRemoteSessionRequest(
             generation: SessionGeneration(rawValue: UUID()),
@@ -194,12 +194,12 @@ func verifyRemotePairingCandidate(
         )
         try await nativeSessions.verifyRemotePairing(request)
         guard !Task.isCancelled else {
-            return false
+            return .rejected
         }
         if case .provisionalAfterVerifiedM5 = record.completion {
             _ = try await pairingPersistence.commitM6(deviceID, Date())
         }
-        return !Task.isCancelled
+        return Task.isCancelled ? .rejected : .verified
     } catch {
         if let failure = error as? NativeSessionFailure {
             candidateVerificationLogger.error(
@@ -210,8 +210,12 @@ func verifyRemotePairingCandidate(
                 authTagHintMatched=\(hintMatched, privacy: .public)
                 """
             )
+            // A transport failure says nothing about identity; verify again.
+            if failure.retryable {
+                return .unreachable
+            }
         }
-        return false
+        return .rejected
     }
 }
 

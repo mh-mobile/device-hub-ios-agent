@@ -66,7 +66,7 @@ extension RemotePairingBonjourTransport {
                 taskToken: taskToken
             ) {
             case let .job(job):
-                let didVerify = await verifyCandidate(
+                let outcome = await verifyCandidate(
                     job.deviceID,
                     job.service
                 )
@@ -75,7 +75,7 @@ extension RemotePairingBonjourTransport {
                 }
                 await completeCandidateVerification(
                     job,
-                    verifiedDeviceID: didVerify ? job.deviceID : nil,
+                    outcome: outcome,
                     browsingToken: browsingToken,
                     taskToken: taskToken
                 )
@@ -149,7 +149,7 @@ extension RemotePairingBonjourTransport {
 
     private func completeCandidateVerification(
         _ job: CandidateVerificationJob,
-        verifiedDeviceID: DeviceID?,
+        outcome: CandidateVerificationOutcome,
         browsingToken: UUID,
         taskToken: UUID
     ) async {
@@ -166,16 +166,48 @@ extension RemotePairingBonjourTransport {
 
         activeCandidateDeviceID = nil
         activeCandidateServiceKey = nil
-        if let verifiedDeviceID {
+        switch outcome {
+        case .verified:
             state.rejectedServiceNames.remove(job.serviceKey)
-            state.matchesByServiceName[job.serviceKey] = verifiedDeviceID
+            state.matchesByServiceName[job.serviceKey] = job.deviceID
             browsingState = state
             yieldAvailability(state)
-        } else {
+        case .rejected:
             state.rejectedServiceNames.insert(job.serviceKey)
             browsingState = state
             await record(.unknownAnnouncement)
+        case .unreachable:
+            browsingState = state
+            scheduleCandidateRetry(job, browsingToken: browsingToken)
         }
+    }
+
+    /// Re-verifies a candidate that could not be reached, as long as the same
+    /// browse generation still sees the same announcement unverified.
+    private func scheduleCandidateRetry(
+        _ job: CandidateVerificationJob,
+        browsingToken: UUID
+    ) {
+        let delay = candidateRetryDelay
+        Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            await self?.retryCandidate(job, browsingToken: browsingToken)
+        }
+    }
+
+    private func retryCandidate(
+        _ job: CandidateVerificationJob,
+        browsingToken: UUID
+    ) {
+        guard var state = browsingState,
+              state.token == browsingToken,
+              state.revisionsByServiceName[job.serviceKey] == job.revision
+        else {
+            return
+        }
+        enqueueCandidateVerification(job.serviceKey, state: &state)
+        browsingState = state
+        startCandidateVerificationIfNeeded(token: browsingToken)
     }
 
     func stopCandidateVerification() async {

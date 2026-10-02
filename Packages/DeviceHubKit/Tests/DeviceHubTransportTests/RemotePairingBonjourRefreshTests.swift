@@ -235,16 +235,16 @@ actor CandidateVerificationProbe {
         @Sendable (
             DeviceID,
             ValidatedRemotePairingService
-        ) async -> Bool
+        ) async -> CandidateVerificationOutcome
     {
         { deviceID, _ in
             await self.verify(deviceID)
         }
     }
 
-    private func verify(_ deviceID: DeviceID) -> Bool {
+    private func verify(_ deviceID: DeviceID) -> CandidateVerificationOutcome {
         callCount += 1
-        return authenticatedDeviceIDs.contains(deviceID)
+        return authenticatedDeviceIDs.contains(deviceID) ? .verified : .rejected
     }
 }
 
