@@ -13,9 +13,9 @@ use idevice::{
         ButtonState, CallInfoBlob, DisplayServiceClient, HardwareButton, HevcAccessUnitAssembler,
         HevcDepacketizerEvent, HevcDiscontinuity, HevcPacketRejection, HidError, ImageFormat,
         IndigoHidClient, KeyboardServiceConfiguration, KeyboardUsage, Orientation,
-        OrientationServiceClient, OrientationState, RotationDirection, RtpPacket,
+        OrientationServiceClient, OrientationState, ReportBlock, RotationDirection, RtpPacket,
         ScreenCaptureServiceClient, ScreenVideoAnswerError, TouchEvent, TouchPoint,
-        UniversalHidServiceClient, build_frame_ack, build_keyframe_request, build_rctl,
+        UniversalHidServiceClient, build_keyframe_request, build_liveness,
         build_screen_audio_offer, build_screen_video_offer, build_start_audio_parameters,
         build_start_video_parameters, is_rtcp, parse_screen_video_answer,
     },
@@ -56,9 +56,18 @@ const DEVELOPER_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIA_START_TIMEOUT: Duration = Duration::from_secs(30);
 const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
-const VIDEO_FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
+// Plain RR+SDES once a second, like devicehub_rs / pymobiledevice3 / appium. The
+// session's RTCP timeout needs it. Per-frame ACKs and RCTL are not sent: they
+// make the encoder's references diverge from our decoder under heavy motion and
+// the picture never recovers.
+const VIDEO_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 const INPUT_TIMEOUT: Duration = Duration::from_secs(12);
 const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+const MEDIA_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+// One control stream at a time. A previous session's `stopAll` can land late
+// (e.g. its teardown was suspended in the background) and would otherwise kill
+// the next session's video while input keeps working.
+static MEDIA_SESSION_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const INPUT_TAP_HOLD: Duration = Duration::from_millis(50);
 const LOCK_BUTTON_HOLD: Duration = Duration::from_millis(300);
 const SIRI_BUTTON_HOLD: Duration = Duration::from_secs(1);
@@ -522,6 +531,11 @@ async fn run_control_stream(
     mut cancellation: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), PublicFailure> {
     require_control_services(handshake)?;
+    let _media_turn = tokio::select! {
+        biased;
+        _ = cancellation.changed() => return Ok(()),
+        turn = MEDIA_SESSION_TURN.lock() => turn,
+    };
     emitter.phase(
         DhConnectionPhase::StartingDisplayStream,
         DhSessionState::Connected,
@@ -575,194 +589,207 @@ async fn run_control_stream(
     )
     .await?;
 
-    let video_call_id = uuid::Uuid::new_v4().to_string().to_uppercase();
-    let our_video_ssrc = nonzero_video_ssrc(uuid::Uuid::new_v4());
-    let video_negotiator_offer =
-        build_userspace_video_offer(&video_call_id, &call_info, our_video_ssrc)?;
-    let video_parameters = build_start_video_parameters(
-        &receiver_ip,
-        video_udp.local_port(),
-        &sender_ip,
-        VIDEO_SENDER_PORT,
-        video_negotiator_offer,
-        CLIENT_SUPPORTED_FEATURES,
-        PRIMARY_DISPLAY_ID,
-        client_session_id,
-    );
-    let response = stage(
-        MEDIA_START_TIMEOUT,
-        video_negotiation_rejected(),
-        display.start_media_stream(video_parameters),
-    )
-    .await?;
-    let answer = extract_negotiator_answer(&response)?;
-    let negotiated_video = parse_negotiated_video(&answer)?;
+    let result = async {
+        let video_call_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let our_video_ssrc = nonzero_video_ssrc(uuid::Uuid::new_v4());
+        let video_negotiator_offer =
+            build_userspace_video_offer(&video_call_id, &call_info, our_video_ssrc)?;
+        let video_parameters = build_start_video_parameters(
+            &receiver_ip,
+            video_udp.local_port(),
+            &sender_ip,
+            VIDEO_SENDER_PORT,
+            video_negotiator_offer,
+            CLIENT_SUPPORTED_FEATURES,
+            PRIMARY_DISPLAY_ID,
+            client_session_id,
+        );
+        let response = stage(
+            MEDIA_START_TIMEOUT,
+            video_negotiation_rejected(),
+            display.start_media_stream(video_parameters),
+        )
+        .await?;
+        let answer = extract_negotiator_answer(&response)?;
+        let negotiated_video = parse_negotiated_video(&answer)?;
 
-    emitter.phase(DhConnectionPhase::OpeningInput, DhSessionState::Connected)?;
-    let mut universal_hid = stage(
-        INPUT_TIMEOUT,
-        input_service_connection_failed(),
-        UniversalHidServiceClient::connect_rsd(adapter, handshake),
-    )
-    .await?;
-    let mut indigo_hid = stage(
-        INPUT_TIMEOUT,
-        input_service_connection_failed(),
-        IndigoHidClient::connect_rsd(adapter, handshake),
-    )
-    .await?;
-    let mut orientation = stage(
-        INPUT_TIMEOUT,
-        orientation_service_connection_failed(),
-        OrientationServiceClient::connect_rsd(adapter, handshake),
-    )
-    .await?;
-    let initial_orientation = stage(
-        INPUT_TIMEOUT,
-        orientation_state_failed(),
-        orientation.current_orientation(),
-    )
-    .await?;
-    let keyboard_service_id = stage(
-        INPUT_TIMEOUT,
-        input_service_connection_failed(),
-        universal_hid.create_keyboard_service(&KeyboardServiceConfiguration::default()),
-    )
-    .await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    controls.enable_input();
-    emitter.input_ready()?;
-    emitter.phase(DhConnectionPhase::Streaming, DhSessionState::Connected)?;
+        emitter.phase(DhConnectionPhase::OpeningInput, DhSessionState::Connected)?;
+        let mut universal_hid = stage(
+            INPUT_TIMEOUT,
+            input_service_connection_failed(),
+            UniversalHidServiceClient::connect_rsd(adapter, handshake),
+        )
+        .await?;
+        let mut indigo_hid = stage(
+            INPUT_TIMEOUT,
+            input_service_connection_failed(),
+            IndigoHidClient::connect_rsd(adapter, handshake),
+        )
+        .await?;
+        let mut orientation = stage(
+            INPUT_TIMEOUT,
+            orientation_service_connection_failed(),
+            OrientationServiceClient::connect_rsd(adapter, handshake),
+        )
+        .await?;
+        let initial_orientation = stage(
+            INPUT_TIMEOUT,
+            orientation_state_failed(),
+            orientation.current_orientation(),
+        )
+        .await?;
+        let keyboard_service_id = stage(
+            INPUT_TIMEOUT,
+            input_service_connection_failed(),
+            universal_hid.create_keyboard_service(&KeyboardServiceConfiguration::default()),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        controls.enable_input();
+        emitter.input_ready()?;
+        emitter.phase(DhConnectionPhase::Streaming, DhSessionState::Connected)?;
 
-    let mut video = LiveVideoState {
-        assembler: HevcAccessUnitAssembler::new(
-            negotiated_video.payload_type,
-            negotiated_video.ssrc,
-        ),
-        last_configuration_revision: 0,
-        geometry: DhDisplayGeometry {
-            pixel_width: 0,
-            pixel_height: 0,
-            orientation: DhOrientation::Unknown as u32,
-            non_flat_orientation: DhOrientation::Unknown as u32,
-            orientation_locked: 0,
-            reserved: [0; 7],
-        },
-    };
-    update_geometry_orientation(&mut video.geometry, &initial_orientation)?;
-    let _audio_udp = audio_udp;
-    let _display = display;
-    let mut cleanup = InputCleanupState::default();
-    let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
-    tokio::pin!(first_video_frame_deadline);
-    let mut has_emitted_video_access_unit = false;
-    let feedback_started_at = tokio::time::Instant::now();
-    let mut feedback_timer = tokio::time::interval_at(
-        feedback_started_at + VIDEO_FEEDBACK_INTERVAL,
-        VIDEO_FEEDBACK_INTERVAL,
-    );
-    feedback_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut feedback =
-        VideoFeedbackState::new(our_video_ssrc, negotiated_video.ssrc, video_call_id);
+        let mut video = LiveVideoState {
+            assembler: HevcAccessUnitAssembler::new(
+                negotiated_video.payload_type,
+                negotiated_video.ssrc,
+            ),
+            last_configuration_revision: 0,
+            geometry: DhDisplayGeometry {
+                pixel_width: 0,
+                pixel_height: 0,
+                orientation: DhOrientation::Unknown as u32,
+                non_flat_orientation: DhOrientation::Unknown as u32,
+                orientation_locked: 0,
+                reserved: [0; 7],
+            },
+        };
+        update_geometry_orientation(&mut video.geometry, &initial_orientation)?;
+        let _audio_udp = audio_udp;
+        let mut cleanup = InputCleanupState::default();
+        let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
+        tokio::pin!(first_video_frame_deadline);
+        let mut has_emitted_video_access_unit = false;
+        let feedback_started_at = tokio::time::Instant::now();
+        let mut feedback_timer = tokio::time::interval_at(
+            feedback_started_at + VIDEO_FEEDBACK_INTERVAL,
+            VIDEO_FEEDBACK_INTERVAL,
+        );
+        feedback_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut feedback =
+            VideoFeedbackState::new(our_video_ssrc, negotiated_video.ssrc, video_call_id);
+        // The device sends RTP and RTCP from its own port, not the senderPort we
+        // offered; RTCP sent to the offered port is silently dropped, so PLI/FIR
+        // and receiver reports never arrive. Reply to wherever the video comes from.
+        let mut video_peer_port = VIDEO_SENDER_PORT;
 
-    let result = 'stream: loop {
-        tokio::select! {
-            biased;
-            changed = cancellation.changed() => {
-                let _ = changed;
-                break Ok(());
-            }
-            datagram = video_udp.recv() => {
-                match datagram {
-                    Ok(datagram) => {
-                        match process_live_video_datagram(
-                            datagram.data,
-                            datagram.source_port,
-                            &mut video,
-                            &mut orientation,
-                            media,
-                            emitter,
-                        ).await {
-                            Ok(outcome) => {
-                                has_emitted_video_access_unit |= outcome.emitted_access_unit;
-                                for feedback_datagram in feedback.consume(&outcome) {
-                                    if video_udp
-                                        .send_to(VIDEO_SENDER_PORT, feedback_datagram)
-                                        .await
-                                        .is_err()
-                                    {
-                                        break 'stream Err(video_control_delivery_failed());
+        let result = 'stream: loop {
+            tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    let _ = changed;
+                    break Ok(());
+                }
+                datagram = video_udp.recv() => {
+                    match datagram {
+                        Ok(datagram) => {
+                            video_peer_port = datagram.source_port;
+                            match process_live_video_datagram(
+                                datagram.data,
+                                datagram.source_port,
+                                &mut video,
+                                &mut orientation,
+                                media,
+                                emitter,
+                            ).await {
+                                Ok(outcome) => {
+                                    has_emitted_video_access_unit |= outcome.emitted_access_unit;
+                                    for feedback_datagram in feedback.consume(&outcome) {
+                                        if video_udp
+                                            .send_to(video_peer_port, feedback_datagram)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break 'stream Err(video_control_delivery_failed());
+                                        }
                                     }
                                 }
+                                Err(failure) => break Err(failure),
                             }
-                            Err(failure) => break Err(failure),
+                        }
+                        Err(_) => {
+                            break Err(PublicFailure::new(
+                                "video_stream_receive_failed",
+                                "video_stream",
+                                true,
+                                "The authenticated video datagram stream closed unexpectedly.",
+                            ));
                         }
                     }
-                    Err(_) => {
-                        break Err(PublicFailure::new(
-                            "video_stream_receive_failed",
-                            "video_stream",
-                            true,
-                            "The authenticated video datagram stream closed unexpectedly.",
-                        ));
+                }
+                _ = feedback_timer.tick() => {
+                    if let Some(report) = feedback.periodic_report() {
+                        if video_udp.send_to(video_peer_port, report).await.is_err() {
+                            break Err(video_control_delivery_failed());
+                        }
                     }
                 }
-            }
-            _ = feedback_timer.tick() => {
-                if let Some(report) = feedback.periodic_report(
-                    feedback_started_at.elapsed(),
-                ) {
-                    if video_udp.send_to(VIDEO_SENDER_PORT, report).await.is_err() {
-                        break Err(video_control_delivery_failed());
-                    }
-                }
-            }
-            () = &mut first_video_frame_deadline, if !has_emitted_video_access_unit => {
-                break Err(PublicFailure::new(
-                    "video_stream_start_timed_out",
-                    "video_stream",
-                    true,
-                    "The authenticated display stream did not produce a complete video frame in time.",
-                ));
-            }
-            command = controls.receive() => {
-                let Some(command) = command else {
+                () = &mut first_video_frame_deadline, if !has_emitted_video_access_unit => {
                     break Err(PublicFailure::new(
-                        "control_channel_closed",
-                        "control_stream",
-                        false,
-                        "The native control channel closed unexpectedly.",
+                        "video_stream_start_timed_out",
+                        "video_stream",
+                        true,
+                        "The authenticated display stream did not produce a complete video frame in time.",
                     ));
-                };
-                let trace_label = input_trace_label(&command);
-                if let Err(failure) = handle_control_command(
-                        command,
-                        &video_udp,
-                        VIDEO_SENDER_PORT,
-                        &mut universal_hid,
-                        keyboard_service_id,
-                        &mut indigo_hid,
-                        &mut orientation,
-                        &mut cleanup,
-                    )
-                    .await
-                {
-                    break Err(failure);
                 }
-                if let Some(trace_label) = trace_label {
-                    input_trace("delivered", &trace_label);
+                command = controls.receive() => {
+                    let Some(command) = command else {
+                        break Err(PublicFailure::new(
+                            "control_channel_closed",
+                            "control_stream",
+                            false,
+                            "The native control channel closed unexpectedly.",
+                        ));
+                    };
+                    let trace_label = input_trace_label(&command);
+                    if let Err(failure) = handle_control_command(
+                            command,
+                            &video_udp,
+                            video_peer_port,
+                            &mut universal_hid,
+                            keyboard_service_id,
+                            &mut indigo_hid,
+                            &mut orientation,
+                            &mut cleanup,
+                        )
+                        .await
+                    {
+                        break Err(failure);
+                    }
+                    if let Some(trace_label) = trace_label {
+                        input_trace("delivered", &trace_label);
+                    }
                 }
             }
-        }
-    };
+        };
 
-    cleanup_inputs(
-        &mut cleanup,
-        &mut universal_hid,
-        keyboard_service_id,
-        &mut indigo_hid,
-    )
+        cleanup_inputs(
+            &mut cleanup,
+            &mut universal_hid,
+            keyboard_service_id,
+            &mut indigo_hid,
+        )
+        .await;
+        result
+    }
     .await;
+
+    // The audio and video streams outlive this connection on the target: without
+    // an explicit stop the iPhone keeps routing its audio into the inert audio
+    // stream (speaker silent) until it reboots.
+    // ponytail: idevice only exposes `stopAll`; this was the active session a moment
+    // ago, so another host would only be hit if it started in this window.
+    let _ = tokio::time::timeout(MEDIA_STOP_TIMEOUT, display.stop_media_stream()).await;
     result
 }
 
@@ -1263,7 +1290,6 @@ struct VideoFeedbackState {
     base_sequence_number: Option<u16>,
     cname: String,
     fir_sequence_number: u8,
-    frame_count: u16,
     highest_extended_sequence_number: u32,
     media_ssrc: u32,
     our_ssrc: u32,
@@ -1275,7 +1301,6 @@ impl VideoFeedbackState {
             base_sequence_number: None,
             cname,
             fir_sequence_number: 0,
-            frame_count: 0,
             highest_extended_sequence_number: 0,
             media_ssrc,
             our_ssrc,
@@ -1290,11 +1315,8 @@ impl VideoFeedbackState {
         let mut datagrams = Vec::with_capacity(
             outcome.completed_frame_timestamps.len() + usize::from(outcome.requires_keyframe),
         );
-        for timestamp in &outcome.completed_frame_timestamps {
-            self.frame_count = self.frame_count.wrapping_add(1);
-            datagrams.push(build_frame_ack(self.our_ssrc, *timestamp));
-        }
         if outcome.requires_keyframe {
+            input_trace("video", "keyframe_request");
             datagrams.push(build_keyframe_request(
                 self.our_ssrc,
                 &self.cname,
@@ -1307,15 +1329,18 @@ impl VideoFeedbackState {
         datagrams
     }
 
-    fn periodic_report(&self, elapsed: Duration) -> Option<Vec<u8>> {
-        self.base_sequence_number?;
-        let clock_ms = (elapsed.as_millis() & u128::from(u16::MAX)) as u16;
-        Some(build_rctl(
-            self.our_ssrc,
-            clock_ms,
-            self.frame_count,
-            self.highest_extended_sequence_number as u16,
-        ))
+    fn periodic_report(&self) -> Option<Vec<u8>> {
+        let base = self.base_sequence_number?;
+        let block = ReportBlock {
+            source_ssrc: self.media_ssrc,
+            fraction_lost: 0,
+            cumulative_lost: 0,
+            highest_seq: u32::from(base).wrapping_add(self.highest_extended_sequence_number),
+            jitter: 0,
+            lsr: 0,
+            dlsr: 0,
+        };
+        Some(build_liveness(self.our_ssrc, &self.cname, &[block]))
     }
 
     fn observe_sequence_number(&mut self, sequence_number: u16) {
@@ -1378,12 +1403,26 @@ async fn process_live_video_datagram(
 
 fn prepare_video_datagram(
     bytes: Vec<u8>,
-    _source_port: u16,
+    source_port: u16,
     assembler: &mut HevcAccessUnitAssembler,
     _last_configuration_revision: &mut u64,
     _media: &MediaEmitter,
 ) -> Result<Option<PreparedVideoDatagram>, PublicFailure> {
-    let (events, sequence_number) = if is_rtcp(&bytes) {
+    // Debug: which ports the device really sends RTP / RTCP from.
+    static LAST_RTP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    static LAST_RTCP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let rtcp = is_rtcp(&bytes);
+    let last = if rtcp {
+        &LAST_RTCP_PORT
+    } else {
+        &LAST_RTP_PORT
+    };
+    if last.swap(source_port, std::sync::atomic::Ordering::Relaxed) != source_port {
+        let kind = if rtcp { "rtcp" } else { "rtp" };
+        let pt = bytes.get(1).copied().unwrap_or(0);
+        input_trace("video", &format!("{kind}_from port={source_port} pt={pt}"));
+    }
+    let (events, sequence_number) = if rtcp {
         return Ok(None);
     } else {
         match RtpPacket::parse_checked(&bytes) {
@@ -3417,14 +3456,26 @@ mod tests {
             highest_sequence_number: Some(u16::MAX - 1),
             requires_keyframe: false,
         };
-        assert_eq!(
-            feedback.consume(&first),
-            vec![build_frame_ack(our_ssrc, 0xA0B0_C0D0)]
+        assert!(
+            feedback.consume(&first).is_empty(),
+            "no per-frame ACK: it desyncs the encoder under motion"
         );
-        assert_eq!(
-            feedback.periodic_report(Duration::from_millis(50)),
-            Some(build_rctl(our_ssrc, 50, 1, 0))
-        );
+        let report = |highest_seq| {
+            Some(build_liveness(
+                our_ssrc,
+                call_id,
+                &[ReportBlock {
+                    source_ssrc: device_ssrc,
+                    fraction_lost: 0,
+                    cumulative_lost: 0,
+                    highest_seq,
+                    jitter: 0,
+                    lsr: 0,
+                    dlsr: 0,
+                }],
+            ))
+        };
+        assert_eq!(feedback.periodic_report(), report(u32::from(u16::MAX - 1)));
 
         let wrapped = VideoDatagramOutcome {
             highest_sequence_number: Some(0),
@@ -3442,8 +3493,9 @@ mod tests {
             )]
         );
         assert_eq!(
-            feedback.periodic_report(Duration::from_millis(100)),
-            Some(build_rctl(our_ssrc, 100, 1, 2))
+            feedback.periodic_report(),
+            report(0x1_0000),
+            "the extended sequence number carries the wraparound"
         );
     }
 

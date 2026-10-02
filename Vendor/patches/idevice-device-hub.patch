@@ -6615,7 +6615,7 @@ index ba4dc2f23d58feff1dd187bd59e5048fe1623403..422a8ffec5b42ddea1132868244233b1
 -pub use rtp::RtpPacket;
 +pub use rtp::{RtpPacket, RtpParseError};
 diff --git a/idevice/src/services/core_device/display_stream/negotiation.rs b/idevice/src/services/core_device/display_stream/negotiation.rs
-index a3eeefb28eceab61782046a2d409290c26af0a48..65736537e1a611de1e759f087b50bc785f651448 100644
+index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef0c49422e 100644
 --- a/idevice/src/services/core_device/display_stream/negotiation.rs
 +++ b/idevice/src/services/core_device/display_stream/negotiation.rs
 @@ -13,6 +13,7 @@
@@ -6634,7 +6634,28 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..65736537e1a611de1e759f087b50bc78
  
  const KEY_CALL_ID: &str = "avcMediaStreamOptionCallID";
  const KEY_MEDIA_BLOB: &str = "avcMediaStreamNegotiatorMediaBlob";
-@@ -275,6 +277,312 @@ pub fn build_screen_video_offer(
+@@ -173,7 +175,8 @@ fn build_screen_media_blob_with_fls(session_id: u32, ntp_time: u64, hevc_fls: &s
+     e.uint_field(2, 1);
+     e.message_field(5, |m| {
+         m.uint_field(1, session_id as u64);
+-        m.uint_field(2, 0);
++        // allowRTCPFB: the device only answers FIR with an IDR when this is set.
++        m.uint_field(2, 1);
+         // H.264 (RTP PT 123), four format descriptors.
+         m.message_field(3, |c| {
+             c.uint_field(1, 123);
+@@ -192,7 +195,9 @@ fn build_screen_media_blob_with_fls(session_id: u32, ntp_time: u64, hevc_fls: &s
+             c.string_field(3, hevc_fls);
+             c.uint_field(4, 14);
+         });
+-        m.uint_field(7, 1);
++        // ltrpEnabled off: with long-term references a packet burst lost under
++        // motion leaves the picture undecodable (pymobiledevice3, go-ios, appium).
++        m.uint_field(7, 0);
+         m.uint_field(8, 63);
+         m.uint_field(12, 1);
+     });
+@@ -275,6 +280,312 @@ pub fn build_screen_video_offer(
      build_offer_plist(call_id, call_info, &blob, NEGOTIATOR_MODE_COREDEVICE_SCREEN)
  }
  
@@ -6947,7 +6968,7 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..65736537e1a611de1e759f087b50bc78
  /// Build the audio screen-sharing `negotiatorOffer`. Sent before the video
  /// offer to establish the screen-sharing session.
  pub fn build_screen_audio_offer(
-@@ -314,7 +622,8 @@ fn build_offer_plist(
+@@ -314,7 +625,8 @@ fn build_offer_plist(
  }
  
  /// Parse the device's answer (`StartResponse.negotiatorAnswer`): a binary plist
@@ -6957,7 +6978,7 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..65736537e1a611de1e759f087b50bc78
  pub fn parse_answer_media_blob(answer: &[u8]) -> Result<MediaNegotiationBlob, IdeviceError> {
      let value: plist::Value = plist::from_bytes(answer)
          .map_err(|e| CoreDeviceError::Negotiation(format!("answer plist decode: {e}")))?;
-@@ -323,6 +632,12 @@ pub fn parse_answer_media_blob(answer: &[u8]) -> Result<MediaNegotiationBlob, Id
+@@ -323,6 +635,12 @@ pub fn parse_answer_media_blob(answer: &[u8]) -> Result<MediaNegotiationBlob, Id
          .and_then(|d| d.get(KEY_MEDIA_BLOB))
          .and_then(|v| v.as_data())
          .ok_or(CoreDeviceError::MissingField(KEY_MEDIA_BLOB))?;
@@ -6970,7 +6991,7 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..65736537e1a611de1e759f087b50bc78
      Ok(MediaNegotiationBlob::decode(blob))
  }
  
-@@ -708,4 +1023,193 @@ mod tests {
+@@ -708,4 +1026,193 @@ mod tests {
          assert_eq!(back.stream_groups[0].payloads[0].rtp_payload, 100);
          assert_eq!(back.stream_groups[0].streams[0].rtp_ssrc, 0xdead_beef);
      }

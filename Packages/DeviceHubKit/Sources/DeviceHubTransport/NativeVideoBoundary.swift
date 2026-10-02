@@ -67,7 +67,8 @@ public final class NativeVideoEventBridge: Sendable {
     ///
     /// VideoToolbox pipeline construction can briefly block the first consumer
     /// while the native callback continues delivering complete access units.
-    public static let defaultBufferCapacity = 64
+    // The first IRAP decode can take long enough for 60+ frames to queue up.
+    public static let defaultBufferCapacity = maximumBufferCapacity
     public static let maximumBufferCapacity = 256
 
     public let events: NativeVideoEventStream
