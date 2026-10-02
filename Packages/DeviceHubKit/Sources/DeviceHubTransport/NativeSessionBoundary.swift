@@ -211,7 +211,8 @@ public struct NativeSessionFailure:
         "video_negotiation_timeout",
         "video_receiver_rejected",
         "video_stream_failed",
-        "video_stream_receive_failed"
+        "video_stream_receive_failed",
+        "video_stream_start_timed_out"
     ]
 
     private static let allowedStages: Set<String> = [
