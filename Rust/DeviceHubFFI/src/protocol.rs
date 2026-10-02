@@ -64,6 +64,10 @@ const VIDEO_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 // The device often ignores a lone PLI/FIR, and without a retry the picture stays
 // frozen until its own periodic keyframe (up to a minute). Re-ask until one lands.
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+// The device keeps sending RTCP sender reports while the screen is static, so a
+// silent video socket means the path is gone (airplane mode, lost access point).
+// Without this the session stayed "Live" until the kernel's TCP timeout.
+const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_TIMEOUT: Duration = Duration::from_secs(12);
 const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const MEDIA_STOP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -674,6 +678,7 @@ async fn run_control_stream(
         let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
         tokio::pin!(first_video_frame_deadline);
         let mut has_emitted_video_access_unit = false;
+        let mut last_video_datagram = std::time::Instant::now();
         let feedback_started_at = tokio::time::Instant::now();
         let mut feedback_timer = tokio::time::interval_at(
             feedback_started_at + VIDEO_FEEDBACK_INTERVAL,
@@ -720,6 +725,7 @@ async fn run_control_stream(
                 datagram = video_udp.recv() => {
                     match datagram {
                         Ok(datagram) => {
+                            last_video_datagram = std::time::Instant::now();
                             video_peer_port = datagram.source_port;
                             match process_live_video_datagram(
                                 datagram.data,
@@ -755,7 +761,13 @@ async fn run_control_stream(
                     }
                 }
                 _ = feedback_timer.tick() => {
-                    let retry = feedback.keyframe_retry(std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    if has_emitted_video_access_unit
+                        && video_stream_stalled(last_video_datagram, now)
+                    {
+                        break Err(media_stalled());
+                    }
+                    let retry = feedback.keyframe_retry(now);
                     for datagram in feedback.periodic_report().into_iter().chain(retry) {
                         if video_udp.send_to(video_peer_port, datagram).await.is_err() {
                             break 'stream Err(video_control_delivery_failed());
@@ -1931,6 +1943,20 @@ const fn orientation_state_failed() -> PublicFailure {
     )
 }
 
+/// Whether an established video stream has gone silent for too long.
+fn video_stream_stalled(last_datagram: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(last_datagram) >= MEDIA_STALL_TIMEOUT
+}
+
+const fn media_stalled() -> PublicFailure {
+    PublicFailure::new(
+        "media_stalled",
+        "video_stream",
+        true,
+        "The authenticated video stream stopped delivering datagrams.",
+    )
+}
+
 const fn video_control_delivery_failed() -> PublicFailure {
     PublicFailure::new(
         "video_control_delivery_failed",
@@ -2465,6 +2491,25 @@ fn event_failure_as_idevice(_: PublicFailure) -> idevice::IdeviceError {
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, ffi::c_void, sync::Mutex};
+
+    #[test]
+    fn a_silent_video_socket_stalls_only_after_the_timeout() {
+        let start = std::time::Instant::now();
+
+        assert!(!video_stream_stalled(start, start));
+        assert!(!video_stream_stalled(
+            start,
+            start + MEDIA_STALL_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(video_stream_stalled(start, start + MEDIA_STALL_TIMEOUT));
+        assert!(
+            !video_stream_stalled(start + Duration::from_secs(1), start),
+            "a datagram newer than the tick is not a stall"
+        );
+        let failure = media_stalled();
+        assert_eq!(failure.code, "media_stalled");
+        assert!(failure.retryable);
+    }
 
     use super::*;
     use crate::{

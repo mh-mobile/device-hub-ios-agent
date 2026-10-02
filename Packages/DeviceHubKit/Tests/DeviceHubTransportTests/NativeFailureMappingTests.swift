@@ -46,6 +46,7 @@ struct NativeFailureMappingTests {
     func specificFailures() {
         #expect(map("video_datagram_rejected", "video_stream_payload_invalid", retryable: false) == .decoderFailed)
         #expect(map("video_configuration_missing", "video_stream", retryable: false) == .decoderFailed)
+        #expect(map("media_stalled", "video_stream", retryable: true) == .mediaStalled)
         #expect(map("unsupported_protocol_version", "control_stream", retryable: false) == .unsupportedProtocolVersion)
         #expect(map("video_negotiation_rejected", "video_negotiation", retryable: false) == .unsupportedProtocolVersion)
     }
@@ -68,13 +69,14 @@ struct NativeFailureMappingTests {
             .contentsOfDirectory(at: Self.rustSources, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "rs" }
             .map { try String(contentsOf: $0, encoding: .utf8) }
-            .map { $0.components(separatedBy: "#[cfg(test)]")[0] }
+            .map(Self.productionSource)
             .joined()
         let pattern = try NSRegularExpression(
             pattern: #"PublicFailure::new\(\s*"([a-z0-9_]+)",\s*"([a-z0-9_]+)""#
         )
         let matches = pattern.matches(in: source, range: NSRange(source.startIndex..., in: source))
-        #expect(matches.count > 20)
+        // Guards against the scan silently covering only part of the sources.
+        #expect(matches.count > 60)
         for match in matches {
             let code = try String(source[#require(Range(match.range(at: 1), in: source))])
             let stage = try String(source[#require(Range(match.range(at: 2), in: source))])
@@ -82,6 +84,17 @@ struct NativeFailureMappingTests {
             #expect(failure.code == code, "code \(code)")
             #expect(failure.stage == stage, "stage \(stage)")
         }
+    }
+
+    /// Drops each file's test module; test-only helpers elsewhere stay.
+    private static func productionSource(_ file: String) -> String {
+        guard let range = file.range(
+            of: #"#\[cfg\(test\)\]\s*mod tests"#,
+            options: .regularExpression
+        ) else {
+            return file
+        }
+        return String(file[..<range.lowerBound])
     }
 
     private static let rustSources = URL(filePath: #filePath)
