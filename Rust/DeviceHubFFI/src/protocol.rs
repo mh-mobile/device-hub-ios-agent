@@ -67,6 +67,8 @@ const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 // Losses close together each report a discontinuity; one request per second
 // is enough, and the retry above covers a request the device ignored.
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
+// Refreshing orientation on a sync sample blocks the receive loop; keep it short.
+const ORIENTATION_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
 // The device keeps sending RTCP sender reports while the screen is static, so a
 // silent video socket means the path is gone (airplane mode, lost access point).
 // Without this the session stayed "Live" until the kernel's TCP timeout.
@@ -1306,12 +1308,11 @@ struct PreparedVideoDatagram {
 }
 
 impl PreparedVideoDatagram {
-    /// Whether emitting these events needs the current device orientation:
-    /// for a new video configuration, or for a sync sample, where a rotation
-    /// that kept identical parameter sets (a 180° turn) becomes visible.
-    /// Mirrors emission order: a discontinuity resets the emitted revision, so
-    /// an access unit after it re-sends its configuration.
-    fn needs_orientation(&self, last_configuration_revision: u64) -> bool {
+    /// Whether emitting these events sends a new video configuration, which
+    /// requires the device orientation. Mirrors emission order: a
+    /// discontinuity resets the emitted revision, so an access unit after it
+    /// re-sends its configuration.
+    fn has_new_configuration(&self, last_configuration_revision: u64) -> bool {
         let mut revision = last_configuration_revision;
         self.events.iter().any(|event| match event {
             HevcDepacketizerEvent::Discontinuity(_) => {
@@ -1319,9 +1320,18 @@ impl PreparedVideoDatagram {
                 false
             }
             HevcDepacketizerEvent::AccessUnit(access_unit) => {
-                access_unit.is_sync || access_unit.parameter_set_revision > revision
+                access_unit.parameter_set_revision > revision
             }
             HevcDepacketizerEvent::PacketRejected(_) => false,
+        })
+    }
+
+    /// Whether a sync sample is emitted, where a rotation that kept identical
+    /// parameter sets (a 180° turn) becomes visible; its orientation refresh
+    /// is best effort.
+    fn has_sync_access_unit(&self) -> bool {
+        self.events.iter().any(|event| {
+            matches!(event, HevcDepacketizerEvent::AccessUnit(access_unit) if access_unit.is_sync)
         })
     }
 }
@@ -1491,19 +1501,29 @@ async fn process_live_video_datagram(
     else {
         return Ok(VideoDatagramOutcome::default());
     };
-    let authoritative_orientation = if prepared.needs_orientation(video.last_configuration_revision)
-    {
-        Some(
+    let authoritative_orientation =
+        if prepared.has_new_configuration(video.last_configuration_revision) {
+            Some(
+                stage(
+                    INPUT_TIMEOUT,
+                    orientation_state_failed(),
+                    orientation.current_orientation(),
+                )
+                .await?,
+            )
+        } else if prepared.has_sync_access_unit() {
+            // Best effort: a slow or failed refresh keeps the last orientation
+            // rather than stalling video or ending the session.
             stage(
-                INPUT_TIMEOUT,
+                ORIENTATION_REFRESH_TIMEOUT,
                 orientation_state_failed(),
                 orientation.current_orientation(),
             )
-            .await?,
-        )
-    } else {
-        None
-    };
+            .await
+            .ok()
+        } else {
+            None
+        };
     emit_prepared_video_datagram(
         prepared,
         &video.assembler,
@@ -1631,9 +1651,13 @@ fn emit_prepared_video_datagram(
                 } else if access_unit.is_sync
                     && let Some(orientation) = authoritative_orientation
                 {
-                    let previous = geometry.orientation;
-                    update_geometry_orientation(geometry, orientation)?;
-                    if geometry.orientation != previous {
+                    // An undetermined answer (face up, no known non-flat
+                    // orientation) keeps the previous geometry.
+                    let mut refreshed = *geometry;
+                    if update_geometry_orientation(&mut refreshed, orientation).is_ok()
+                        && refreshed.orientation != geometry.orientation
+                    {
+                        *geometry = refreshed;
                         emit_display_geometry_if_complete(emitter, *geometry)?;
                     }
                 }
@@ -1700,7 +1724,7 @@ fn process_video_datagram_outcome(
         return Ok(VideoDatagramOutcome::default());
     };
     let orientation = prepared
-        .needs_orientation(*last_configuration_revision)
+        .has_new_configuration(*last_configuration_revision)
         .then(|| test_orientation_state(*geometry))
         .transpose()?;
     emit_prepared_video_datagram(
@@ -2886,7 +2910,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(prepared.needs_orientation(last_configuration_revision));
+        assert!(!prepared.has_new_configuration(last_configuration_revision));
+        assert!(prepared.has_sync_access_unit());
         let mut flipped = geometry;
         flipped.orientation = DhOrientation::PortraitUpsideDown as u32;
         flipped.non_flat_orientation = DhOrientation::PortraitUpsideDown as u32;
@@ -2902,12 +2927,45 @@ mod tests {
         )
         .unwrap();
 
-        let events = capture.events.lock().unwrap();
-        let access_unit_geometry = events.last().unwrap().1.unwrap();
+        {
+            let events = capture.events.lock().unwrap();
+            let access_unit_geometry = events.last().unwrap().1.unwrap();
+            assert_eq!(
+                access_unit_geometry.orientation,
+                DhOrientation::PortraitUpsideDown as u32
+            );
+        }
         assert_eq!(
-            access_unit_geometry.orientation,
+            geometry.orientation,
             DhOrientation::PortraitUpsideDown as u32
         );
+
+        // A face-up device with no known non-flat orientation is not an error
+        // on this best-effort path: the previous orientation stays.
+        let prepared = prepare_video_datagram(
+            test_rtp_datagram(TEST_VIDEO_PAYLOAD_TYPE, 5, 5, true, &test_nal(19, &[0xF2])),
+            VIDEO_SENDER_PORT,
+            &mut assembler,
+            &mut last_configuration_revision,
+            &media,
+        )
+        .unwrap()
+        .unwrap();
+        let undetermined = OrientationState {
+            orientation: Orientation::FaceUp,
+            non_flat_orientation: Orientation::Unknown("unknown".into()),
+            locked: false,
+        };
+        emit_prepared_video_datagram(
+            prepared,
+            &assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            Some(&undetermined),
+            &media,
+            &emitter,
+        )
+        .unwrap();
         assert_eq!(
             geometry.orientation,
             DhOrientation::PortraitUpsideDown as u32

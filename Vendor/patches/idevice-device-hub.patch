@@ -6690,7 +6690,7 @@ index ba4dc2f23d58feff1dd187bd59e5048fe1623403..422a8ffec5b42ddea1132868244233b1
 -pub use rtp::RtpPacket;
 +pub use rtp::{RtpPacket, RtpParseError};
 diff --git a/idevice/src/services/core_device/display_stream/negotiation.rs b/idevice/src/services/core_device/display_stream/negotiation.rs
-index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef0c49422e 100644
+index a3eeefb28eceab61782046a2d409290c26af0a48..7e9a4e34ea428cfa8e747d8b82274a0e0e5b7564 100644
 --- a/idevice/src/services/core_device/display_stream/negotiation.rs
 +++ b/idevice/src/services/core_device/display_stream/negotiation.rs
 @@ -13,6 +13,7 @@
@@ -6843,7 +6843,7 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
 +                        match raw_payload_type {
 +                            None => saw_missing_payload_type = true,
 +                            Some(value) => match u8::try_from(value) {
-+                                Ok(value) if (1..=127).contains(&value) => {
++                                Ok(value) if is_usable_payload_type(value) => {
 +                                    saw_valid_payload_type = true;
 +                                    payload_types.push(value);
 +                                }
@@ -6938,7 +6938,7 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
 +                saw_invalid_payload_type = true;
 +                continue;
 +            };
-+            if !(1..=127).contains(&payload_type) {
++            if !is_usable_payload_type(payload_type) {
 +                saw_invalid_payload_type = true;
 +                continue;
 +            }
@@ -7066,7 +7066,21 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
      Ok(MediaNegotiationBlob::decode(blob))
  }
  
-@@ -708,4 +1026,193 @@ mod tests {
+@@ -673,6 +991,13 @@ impl EncodeDecodeFeatures {
+     }
+ }
+ 
++/// A dynamic RTP payload type that cannot be mistaken for RTCP when RTP and
++/// RTCP share a port: with the marker bit set, 64..=95 occupy the RTCP packet
++/// type range 192..=223 (RFC 5761 section 4).
++fn is_usable_payload_type(payload_type: u8) -> bool {
++    (1..=127).contains(&payload_type) && !(64..=95).contains(&payload_type)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -708,4 +1033,204 @@ mod tests {
          assert_eq!(back.stream_groups[0].payloads[0].rtp_payload, 100);
          assert_eq!(back.stream_groups[0].streams[0].rtp_ssrc, 0xdead_beef);
      }
@@ -7173,6 +7187,17 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
 +
 +        assert_eq!(stream.payload_type, 100);
 +        assert_eq!(stream.ssrc, 3);
++    }
++
++    #[test]
++    fn payload_types_that_collide_with_rtcp_are_rejected() {
++        // Same answer as above with payload type 72 instead of 100.
++        let raw = vec![0x2a, 0x08, 0x08, 0x03, 0x1a, 0x04, 0x08, 0x48, 0x20, 0x0e];
++
++        assert_eq!(
++            parse_screen_video_answer(&legacy_screen_answer(&raw)),
++            Err(ScreenVideoAnswerError::PayloadTypeInvalid)
++        );
 +    }
 +
 +    fn legacy_screen_answer(raw: &[u8]) -> Vec<u8> {
