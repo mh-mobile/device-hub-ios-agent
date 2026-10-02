@@ -13,4 +13,6 @@ DEVICE_HUB_PAIRING_KEYCHAIN_SERVICE = DeviceHub.PairingVault
 // Optional agent HTTP API (port 8765). Off unless a token of at least 16
 // characters is set; requests must come from loopback or Tailscale and send
 // "Authorization: Bearer <token>". Generate one with: openssl rand -hex 24
+// The token is stored in the app in plain text: never set it in a build you
+// give to others.
 // DEVICE_HUB_AGENT_TOKEN =

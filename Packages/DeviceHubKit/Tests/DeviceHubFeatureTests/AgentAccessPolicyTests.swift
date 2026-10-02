@@ -106,6 +106,22 @@ struct AgentHTTPRequestTests {
         #expect(request.number("y") == 2.5)
     }
 
+    @Test("a header with an empty value is valid, a line without a colon is not")
+    func emptyHeaderValue() {
+        let raw = Data("GET /screen HTTP/1.1\r\nX-Empty:\r\nAuthorization: Bearer t\r\n\r\n".utf8)
+
+        guard case let .complete(request) = AgentHTTPRequest.parse(raw) else {
+            Issue.record("expected a complete request")
+            return
+        }
+        #expect(request.header("x-empty") == "")
+        #expect(request.header("authorization") == "Bearer t")
+        #expect(
+            AgentHTTPRequest.parse(Data("GET / HTTP/1.1\r\nNoColon\r\n\r\n".utf8))
+                == .malformed
+        )
+    }
+
     @Test("partial input waits and oversized or malformed input is rejected")
     func incompleteAndMalformed() {
         #expect(AgentHTTPRequest.parse(Data("GET / HTTP/1.1\r\n".utf8)) == .incomplete)

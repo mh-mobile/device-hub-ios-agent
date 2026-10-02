@@ -19,8 +19,12 @@ public final class AgentHTTPServer: @unchecked Sendable {
     /// A connection that has not delivered a full request by then is closed.
     static let requestTimeout: DispatchTimeInterval = .seconds(10)
     static let restartDelay: DispatchTimeInterval = .seconds(2)
+    /// Connections served at once; more are refused until one closes.
+    static let maximumConnections = 8
 
     private var listener: NWListener?
+    /// Touched only on `queue`.
+    private var openConnections = 0
     private let queue = DispatchQueue(label: "agent.http")
 
     /// Starts listening when `policy` is non-nil; a failed listener restarts itself.
@@ -39,7 +43,16 @@ public final class AgentHTTPServer: @unchecked Sendable {
             return
         }
         listener.newConnectionHandler = { [weak self] connection in
-            self?.serve(connection, policy: policy)
+            // Untrusted sources and excess connections are dropped before
+            // anything is read, so they cannot hold buffers or the queue.
+            guard let self,
+                  AgentAccessPolicy.isTrustedSource(Self.sourceAddress(of: connection)),
+                  openConnections < Self.maximumConnections
+            else {
+                connection.cancel()
+                return
+            }
+            serve(connection, policy: policy)
         }
         listener.stateUpdateHandler = { [weak self, weak listener] state in
             guard let self, case .failed = state else {
@@ -56,6 +69,17 @@ public final class AgentHTTPServer: @unchecked Sendable {
     }
 
     private func serve(_ connection: NWConnection, policy: AgentAccessPolicy) {
+        openConnections += 1
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed:
+                connection.cancel()
+            case .cancelled:
+                self?.openConnections -= 1
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
         let request = PendingRequest()
         // Bounds only how long a client may take to send its request; a
@@ -240,11 +264,11 @@ struct AgentHTTPRequest: Equatable {
         }
         var headers: [String: String] = [:]
         for line in lines.dropFirst() {
-            let parts = line.split(separator: ":", maxSplits: 1)
-            guard parts.count == 2 else {
+            guard let colon = line.firstIndex(of: ":") else {
                 return .malformed
             }
-            headers[parts[0].lowercased()] = parts[1].trimmingCharacters(in: .whitespaces)
+            headers[line[..<colon].lowercased()] = line[line.index(after: colon)...]
+                .trimmingCharacters(in: .whitespaces)
         }
         var length = 0
         if let declared = headers["content-length"] {
