@@ -15,6 +15,12 @@ The upstream project is MIT licensed. Its unmodified license notice is retained
 at `Licenses/idevice-MIT.txt` and is also materialized as
 `Vendor/idevice/LICENSE.txt` during setup.
 
+To change the patched source, edit `Vendor/idevice` and run
+`mise run protocol:patch`. It rewrites the patch as the checkout's diff
+against the pinned revision (new files included) and records the new patch
+and tree digests in `BuildSupport/bootstrap_idevice.py`; review and commit
+both, then run `mise run test:rust`.
+
 Updating idevice requires reviewing the upstream diff, rebasing the patch,
 updating the revision and integrity digests in
 `BuildSupport/bootstrap_idevice.py` and `Rust/DeviceHubFFI/Cargo.toml`,
