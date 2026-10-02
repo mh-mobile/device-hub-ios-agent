@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -43,7 +44,7 @@ use crate::{
     png::validate_png,
     session::{
         ControlCommand, ControlGate, EventEmitter, MediaEmitter, PersistenceGate, PublicFailure,
-        RsdSnapshot,
+        RsdSnapshot, collapse_moves,
     },
 };
 
@@ -632,7 +633,7 @@ async fn run_control_stream(
             UniversalHidServiceClient::connect_rsd(adapter, handshake),
         )
         .await?;
-        let mut indigo_hid = stage(
+        let indigo_hid = stage(
             INPUT_TIMEOUT,
             input_service_connection_failed(),
             IndigoHidClient::connect_rsd(adapter, handshake),
@@ -657,6 +658,23 @@ async fn run_control_stream(
         )
         .await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // Shared with the input loop, which rotates; video queries it.
+        let orientation = tokio::sync::Mutex::new(orientation);
+        // HID writes and tap holds run in their own loop, polled alongside
+        // video below, so a slow HID round trip or a held button never stops
+        // video datagrams from being read.
+        let (input_commands, input_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let input_stopping = AtomicBool::new(false);
+        let input_loop = run_input_loop(
+            input_receiver,
+            &input_stopping,
+            universal_hid,
+            keyboard_service_id,
+            indigo_hid,
+            &orientation,
+        );
+        tokio::pin!(input_loop);
+        let mut input_finished = false;
         controls.enable_input();
         emitter.input_ready()?;
         emitter.phase(DhConnectionPhase::Streaming, DhSessionState::Connected)?;
@@ -679,7 +697,6 @@ async fn run_control_stream(
         update_geometry_orientation(&mut video.geometry, &initial_orientation)?;
         let mut audio_open = true;
         let mut last_audio_sequence: Option<u16> = None;
-        let mut cleanup = InputCleanupState::default();
         let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
         tokio::pin!(first_video_frame_deadline);
         let mut has_emitted_video_access_unit = false;
@@ -722,24 +739,31 @@ async fn run_control_stream(
                             "The native control channel closed unexpectedly.",
                         ));
                     };
-                    let trace_label = input_trace_label(&command);
-                    if let Err(failure) = handle_control_command(
-                            command,
-                            &video_udp,
-                            video_peer_port,
-                            &mut universal_hid,
-                            keyboard_service_id,
-                            &mut indigo_hid,
-                            &mut orientation,
-                            &mut cleanup,
-                        )
-                        .await
-                    {
-                        break Err(failure);
+                    match command {
+                        ControlCommand::VideoControlDatagram(datagram) => {
+                            if video_udp
+                                .send_to(video_peer_port, datagram.bytes)
+                                .await
+                                .is_err()
+                            {
+                                break Err(video_control_delivery_failed());
+                            }
+                        }
+                        ControlCommand::VideoNegotiation => break Err(stale_video_negotiation()),
+                        // The input loop owns the receiver until teardown.
+                        command => {
+                            let _ = input_commands.send(command);
+                        }
                     }
-                    if let Some(trace_label) = trace_label {
-                        input_trace("delivered", &trace_label);
-                    }
+                }
+                result = &mut input_loop, if !input_finished => {
+                    input_finished = true;
+                    break Err(result.err().unwrap_or_else(|| PublicFailure::new(
+                        "control_channel_closed",
+                        "control_stream",
+                        false,
+                        "The native input loop ended unexpectedly.",
+                    )));
                 }
                 // Device audio: each RTP payload is one raw AAC-ELD frame. Handed to
                 // the controller through the datagram event, which the app plays.
@@ -772,7 +796,7 @@ async fn run_control_stream(
                                 datagram.data,
                                 datagram.source_port,
                                 &mut video,
-                                &mut orientation,
+                                &orientation,
                                 media,
                                 emitter,
                             ).await {
@@ -826,13 +850,13 @@ async fn run_control_stream(
             }
         };
 
-        cleanup_inputs(
-            &mut cleanup,
-            &mut universal_hid,
-            keyboard_service_id,
-            &mut indigo_hid,
-        )
-        .await;
+        // Stop taking queued input, then let the input loop release anything
+        // still held before the media stream is stopped.
+        input_stopping.store(true, Ordering::Release);
+        drop(input_commands);
+        if !input_finished {
+            let _ = tokio::time::timeout(INPUT_TIMEOUT + INPUT_CLEANUP_TIMEOUT, input_loop).await;
+        }
         result
     }
     .await;
@@ -1205,21 +1229,75 @@ fn remove_last_button(buttons: &mut Vec<HardwareButton>, button: HardwareButton)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_control_command(
+/// Owns HID delivery for one stream: commands arrive in order, consecutive
+/// moves collapse to the latest, and held inputs are released on exit.
+async fn run_input_loop(
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<ControlCommand>,
+    stopping: &AtomicBool,
+    mut universal_hid: UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
+    keyboard_service_id: u64,
+    mut indigo_hid: IndigoHidClient<Box<dyn idevice::ReadWrite>>,
+    orientation: &tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>,
+) -> Result<(), PublicFailure> {
+    let mut cleanup = InputCleanupState::default();
+    let mut stashed = None;
+    let result = loop {
+        let command = match stashed.take() {
+            Some(command) => command,
+            None => match commands.recv().await {
+                Some(command) => command,
+                None => break Ok(()),
+            },
+        };
+        if stopping.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        let command = collapse_moves(command, || commands.try_recv().ok(), &mut stashed);
+        let trace_label = input_trace_label(&command);
+        if let Err(failure) = handle_input_command(
+            command,
+            &mut universal_hid,
+            keyboard_service_id,
+            &mut indigo_hid,
+            orientation,
+            &mut cleanup,
+        )
+        .await
+        {
+            break Err(failure);
+        }
+        if let Some(trace_label) = trace_label {
+            input_trace("delivered", &trace_label);
+        }
+    };
+    cleanup_inputs(
+        &mut cleanup,
+        &mut universal_hid,
+        keyboard_service_id,
+        &mut indigo_hid,
+    )
+    .await;
+    result
+}
+
+async fn handle_input_command(
     command: ControlCommand,
-    video_udp: &tcp::handle::UdpSocketHandle,
-    remote_video_port: u16,
     universal_hid: &mut UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
     keyboard_service_id: u64,
     indigo_hid: &mut IndigoHidClient<Box<dyn idevice::ReadWrite>>,
-    orientation: &mut OrientationServiceClient<Box<dyn idevice::ReadWrite>>,
+    orientation: &tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>,
     cleanup: &mut InputCleanupState,
 ) -> Result<(), PublicFailure> {
     match command {
-        ControlCommand::VideoControlDatagram(datagram) => video_udp
-            .send_to(remote_video_port, datagram.bytes)
-            .await
-            .map_err(|_| video_control_delivery_failed()),
+        // The stream loop handles these itself and never forwards them.
+        ControlCommand::VideoControlDatagram(_) | ControlCommand::VideoNegotiation => {
+            Err(PublicFailure::new(
+                "invalid_state",
+                "control_stream",
+                false,
+                "A media control command reached the input loop.",
+            ))
+        }
         ControlCommand::Touch(intent) => {
             match intent {
                 TouchIntent::Tap { x, y } => {
@@ -1277,14 +1355,19 @@ async fn handle_control_command(
                 RotationIntent::Left => RotationDirection::Left,
                 RotationIntent::Right => RotationDirection::Right,
             };
-            orientation.rotate(direction).await.map_err(|_| {
-                PublicFailure::new(
-                    "rotation_failed",
-                    "rotation",
-                    true,
-                    "The authenticated orientation service rejected the rotation.",
-                )
-            })?;
+            orientation
+                .lock()
+                .await
+                .rotate(direction)
+                .await
+                .map_err(|_| {
+                    PublicFailure::new(
+                        "rotation_failed",
+                        "rotation",
+                        true,
+                        "The authenticated orientation service rejected the rotation.",
+                    )
+                })?;
             // A successful control reply does not prove that the encoded
             // display changed. The next video configuration owns geometry.
             Ok(())
@@ -1293,13 +1376,16 @@ async fn handle_control_command(
             release_all_inputs_bounded(cleanup, universal_hid, keyboard_service_id, indigo_hid)
                 .await
         }
-        ControlCommand::VideoNegotiation => Err(PublicFailure::new(
-            "stale_video_negotiation",
-            "video_negotiation",
-            false,
-            "A duplicate video negotiation acknowledgement was received.",
-        )),
     }
+}
+
+const fn stale_video_negotiation() -> PublicFailure {
+    PublicFailure::new(
+        "stale_video_negotiation",
+        "video_negotiation",
+        false,
+        "A duplicate video negotiation acknowledgement was received.",
+    )
 }
 
 struct PreparedVideoDatagram {
@@ -1487,7 +1573,7 @@ async fn process_live_video_datagram(
     bytes: Vec<u8>,
     source_port: u16,
     video: &mut LiveVideoState,
-    orientation: &mut OrientationServiceClient<Box<dyn idevice::ReadWrite>>,
+    orientation: &tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>,
     media: &MediaEmitter,
     emitter: &EventEmitter,
 ) -> Result<VideoDatagramOutcome, PublicFailure> {
@@ -1504,11 +1590,9 @@ async fn process_live_video_datagram(
     let authoritative_orientation =
         if prepared.has_new_configuration(video.last_configuration_revision) {
             Some(
-                stage(
-                    INPUT_TIMEOUT,
-                    orientation_state_failed(),
-                    orientation.current_orientation(),
-                )
+                stage(INPUT_TIMEOUT, orientation_state_failed(), async {
+                    orientation.lock().await.current_orientation().await
+                })
                 .await?,
             )
         } else if prepared.has_sync_access_unit() {
@@ -1517,7 +1601,7 @@ async fn process_live_video_datagram(
             stage(
                 ORIENTATION_REFRESH_TIMEOUT,
                 orientation_state_failed(),
-                orientation.current_orientation(),
+                async { orientation.lock().await.current_orientation().await },
             )
             .await
             .ok()

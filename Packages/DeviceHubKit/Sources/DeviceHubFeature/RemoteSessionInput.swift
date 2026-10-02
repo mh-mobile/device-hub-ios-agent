@@ -222,6 +222,26 @@ extension RemoteSessionFeature {
         }
 
         var mutableSession = session
+        // A move still waiting behind the command in flight is superseded by a
+        // newer move of the same contact: only the latest position matters.
+        if case let .touch(touch) = command, touch.phase == .moved,
+           mutableSession.pendingCommands.count >= 2,
+           let last = mutableSession.pendingCommands.last,
+           case let .touch(queued) = last.command,
+           queued.phase == .moved,
+           queued.contactID == touch.contactID
+        {
+            mutableSession.pendingCommands[mutableSession.pendingCommands.count - 1] =
+                PendingRemoteCommand(
+                    attemptID: last.attemptID,
+                    authorization: authorization,
+                    command: command,
+                    sequenceNumber: last.sequenceNumber,
+                    sessionID: last.sessionID
+                )
+            state.session = mutableSession
+            return .none
+        }
         let pendingCommand = PendingRemoteCommand(
             attemptID: session.attemptID,
             authorization: authorization,

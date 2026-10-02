@@ -35,6 +35,9 @@ use crate::{
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const ACK_QUEUE_CAPACITY: usize = 4;
 const CONTROL_QUEUE_CAPACITY: usize = 128;
+/// Queue slots touch moves may never use, so a flood of moves cannot make a
+/// down, up, cancel, or any other command fail with a full queue.
+const EDGE_RESERVED_CAPACITY: usize = 16;
 const STATE_READY: u8 = 0;
 const STATE_RUNNING: u8 = 1;
 const STATE_CANCELLED: u8 = 2;
@@ -192,18 +195,43 @@ fn is_touch_move(command: &ControlCommand) -> bool {
     matches!(command, ControlCommand::Touch(TouchIntent::Move { .. }))
 }
 
-/// Queues a command for the protocol task. A touch move that does not fit is
-/// dropped: a later move or the release supersedes it, and failing the
-/// session because a finger moved faster than HID delivery ended sessions
-/// during fast scrolling. Any other command that does not fit still fails.
+/// Replaces a touch move with the latest of the moves queued right behind
+/// it. The first non-move command read ahead is left in `stash` so it is
+/// returned next, keeping every other command in order.
+pub(crate) fn collapse_moves(
+    mut command: ControlCommand,
+    mut try_next: impl FnMut() -> Option<ControlCommand>,
+    stash: &mut Option<ControlCommand>,
+) -> ControlCommand {
+    while is_touch_move(&command) {
+        match try_next() {
+            Some(next) if is_touch_move(&next) => command = next,
+            Some(next) => {
+                *stash = Some(next);
+                break;
+            }
+            None => break,
+        }
+    }
+    command
+}
+
+/// Queues a command for the protocol task. A touch move is dropped once only
+/// the reserved slots are left: a later move or the release (which carries
+/// the final position) supersedes it, and failing the session because a
+/// finger moved faster than HID delivery ended sessions during fast
+/// scrolling. Other commands may use the reserve and fail only when it too
+/// is exhausted.
 fn enqueue_on(
     controls: &mpsc::Sender<ControlCommand>,
     command: ControlCommand,
     stage: &'static str,
 ) -> Result<(), PublicFailure> {
+    if is_touch_move(&command) && controls.capacity() <= EDGE_RESERVED_CAPACITY {
+        return Ok(());
+    }
     match controls.try_send(command) {
         Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(command)) if is_touch_move(&command) => Ok(()),
         Err(_) => Err(PublicFailure::new(
             "control_queue_unavailable",
             stage,
@@ -234,21 +262,16 @@ impl ControlGate {
     /// while video went unread. Down, up, cancel, and every other command keep
     /// their order and are never dropped.
     pub(crate) async fn receive(&mut self) -> Option<ControlCommand> {
-        let mut command = match self.stashed.take() {
+        let command = match self.stashed.take() {
             Some(command) => command,
             None => self.receiver.recv().await?,
         };
-        while is_touch_move(&command) {
-            match self.receiver.try_recv() {
-                Ok(next) if is_touch_move(&next) => command = next,
-                Ok(next) => {
-                    self.stashed = Some(next);
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
-        Some(command)
+        let receiver = &mut self.receiver;
+        Some(collapse_moves(
+            command,
+            || receiver.try_recv().ok(),
+            &mut self.stashed,
+        ))
     }
 }
 
@@ -1646,21 +1669,31 @@ mod tests {
     }
 
     #[test]
-    fn a_full_queue_drops_a_move_but_rejects_an_edge() {
-        let (sender, _gate) = test_gate(1);
-        sender
-            .try_send(ControlCommand::Touch(TouchIntent::Down { x: 0, y: 0 }))
-            .unwrap();
-
-        assert!(
-            enqueue_on(
-                &sender,
-                ControlCommand::Touch(TouchIntent::Move { x: 1, y: 1 }),
-                "touch_input"
-            )
-            .is_ok(),
-            "a later move supersedes a dropped one"
-        );
+    fn moves_can_never_take_the_room_reserved_for_touch_edges() {
+        let (sender, _gate) = test_gate(EDGE_RESERVED_CAPACITY + 4);
+        for x in 0..64 {
+            assert!(
+                enqueue_on(
+                    &sender,
+                    ControlCommand::Touch(TouchIntent::Move { x, y: 0 }),
+                    "touch_input"
+                )
+                .is_ok(),
+                "a move that does not fit is dropped, never an error"
+            );
+        }
+        assert_eq!(sender.capacity(), EDGE_RESERVED_CAPACITY);
+        for _ in 0..EDGE_RESERVED_CAPACITY {
+            assert!(
+                enqueue_on(
+                    &sender,
+                    ControlCommand::Touch(TouchIntent::Up { x: 1, y: 1 }),
+                    "touch_input"
+                )
+                .is_ok(),
+                "a flood of moves cannot make an up fail"
+            );
+        }
         assert!(
             enqueue_on(
                 &sender,
