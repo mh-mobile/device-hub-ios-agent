@@ -17,8 +17,9 @@ actor DeviceSessionCoordinator {
 
     private var activeSession: OwnedSession?
     private var latestAttemptID: UUID?
-    /// The most recent close, which `replace` awaits so a new connection
-    /// never overlaps the previous session's input release and disconnect.
+    /// The most recent close or connection attempt, which `replace` awaits
+    /// so a new connection never overlaps the previous session's input
+    /// release and disconnect.
     private var teardown: Task<Void, Never>?
 
     func command(
@@ -103,7 +104,17 @@ actor DeviceSessionCoordinator {
         try Task.checkCancellation()
         latestAttemptID = attemptID
 
-        await teardown?.value
+        // This attempt joins the chain until it either owns the session or
+        // has disconnected it, so a connect still in flight when Stop arrives
+        // (close finds nothing to close) never overlaps the next one.
+        let previousTeardown = teardown
+        let (attemptSettled, settle) = AsyncStream<Never>.makeStream()
+        defer { settle.finish() }
+        teardown = Task {
+            await previousTeardown?.value
+            for await _ in attemptSettled {}
+        }
+        await previousTeardown?.value
         guard !Task.isCancelled, latestAttemptID == attemptID else {
             throw CancellationError()
         }

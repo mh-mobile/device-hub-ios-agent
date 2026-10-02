@@ -71,6 +71,72 @@ struct DeviceSessionCoordinatorTests {
             "connect-2"
         ])
     }
+
+    @Test("a connection superseded mid-connect disconnects before the next one starts")
+    func supersededConnectionJoinsTeardown() async throws {
+        let log = OrderLog()
+        let gate = Gate()
+        let target = device(id: "device", name: "Test iPhone")
+        let first = DeviceSession(
+            id: DeviceSessionID(rawValue: fixtureUUID(74)),
+            device: target,
+            events: AsyncThrowingStream { $0.finish() },
+            frames: AsyncStream { $0.finish() },
+            command: { _ in },
+            disconnect: { await log.append("disconnect-1") }
+        )
+        let second = DeviceSession(
+            id: DeviceSessionID(rawValue: fixtureUUID(75)),
+            device: target,
+            events: AsyncThrowingStream { $0.finish() },
+            frames: AsyncStream { $0.finish() },
+            command: { _ in },
+            disconnect: {}
+        )
+        let sessions = SessionQueue([first, second])
+        var client = DeviceHubClient.testValue
+        client.connect = { _ in
+            let session = await sessions.next()
+            if session.id == first.id {
+                await log.append("connect-1-started")
+                await gate.wait()
+            } else {
+                await log.append("connect-2")
+            }
+            return session
+        }
+        let coordinator = DeviceSessionCoordinator()
+        let firstAttempt = fixtureUUID(76)
+        let secondAttempt = fixtureUUID(77)
+
+        let superseded = Task {
+            try await coordinator.replace(
+                attemptID: firstAttempt,
+                deviceID: target.id,
+                using: client
+            )
+        }
+        await log.waitFor("connect-1-started")
+        // Stop arrives while the first connect is still in flight.
+        let closed = await coordinator.close(attemptID: firstAttempt)
+        #expect(closed == nil)
+        let connecting = Task {
+            try await coordinator.replace(
+                attemptID: secondAttempt,
+                deviceID: target.id,
+                using: client
+            )
+        }
+        for _ in 0 ..< 200 {
+            await Task.yield()
+        }
+        await gate.open()
+        _ = try? await superseded.value
+        _ = try await connecting.value
+
+        let entries = await log.entries
+        #expect(entries == ["connect-1-started", "disconnect-1", "connect-2"])
+    }
 }
 
 private actor OrderLog {

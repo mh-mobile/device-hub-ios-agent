@@ -79,6 +79,7 @@ extension RemoteSessionFeature {
         session.evaluatedAt = now
         session.frame = frame
         session.remoteState = remoteState
+        state.reconnectAttempts = 0
         state.remediation = nil
         state.session = session
         if previousScreen?.kind != .videoFrame,

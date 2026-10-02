@@ -286,7 +286,7 @@ public enum DeviceHubError: Error, CaseIterable, Codable, Hashable, Sendable {
         case .decoderFailed:
             UserFacingCopy(
                 title: "Screen Couldn’t Be Displayed",
-                message: "Device Hub is restarting the live view."
+                message: "Reconnect to show the screen again."
             )
         }
     }

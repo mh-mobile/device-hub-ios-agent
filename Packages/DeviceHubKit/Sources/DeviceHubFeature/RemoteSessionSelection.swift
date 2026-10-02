@@ -27,6 +27,7 @@ extension RemoteSessionFeature {
 
             state.selectedDeviceID = deviceID
             state.isViewingStopped = false
+            state.reconnectAttempts = 0
             state.pairing = nil
             return beginSessionIfPossible(
                 state: &state,
@@ -57,7 +58,8 @@ extension RemoteSessionFeature {
                 }
                 return reconnectEffect(
                     attemptID: attemptID,
-                    after: session.connectionError
+                    after: session.connectionError,
+                    state: state
                 )
             }
             guard state.lifecycle == .active,
@@ -71,6 +73,7 @@ extension RemoteSessionFeature {
             else {
                 return .none
             }
+            state.reconnectAttempts += 1
             return beginSessionIfPossible(
                 state: &state,
                 device: device
@@ -80,6 +83,7 @@ extension RemoteSessionFeature {
             guard let device = state.selectedDevice else {
                 return .none
             }
+            state.reconnectAttempts = 0
             return beginSessionIfPossible(
                 state: &state,
                 device: device
@@ -90,6 +94,7 @@ extension RemoteSessionFeature {
                 return .none
             }
             state.isViewingStopped = false
+            state.reconnectAttempts = 0
             return beginSessionIfPossible(
                 state: &state,
                 device: device
@@ -229,13 +234,15 @@ extension RemoteSessionFeature {
         }
         state.session = session
         if device.pairingState != .paired {
+            let ending = session
             session.connectionError = .needsPairing
+            session.sessionID = nil
             state.session = session
             state.remediation = DeviceHubRemediation(error: .needsPairing)
             state.activeContactIDs.removeAll()
             return .concatenate(
                 cancelSessionEffects(),
-                closeSessionEffect(session: session)
+                closeSessionEffect(session: ending)
             )
         }
         guard wasAcceptingInput, !session.acceptsInput else {

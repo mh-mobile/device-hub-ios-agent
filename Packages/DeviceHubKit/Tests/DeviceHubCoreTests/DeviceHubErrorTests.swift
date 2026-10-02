@@ -149,6 +149,15 @@ struct DeviceHubErrorTests {
     }
 
     @Test
+    func onlyAutomaticallyRetriedErrorsSayTheAppIsRecovering() {
+        for error in DeviceHubError.allCases where error.retryability != .automatic {
+            let message = error.userFacing.message.lowercased()
+            #expect(!message.contains("is reconnecting"), "\(error)")
+            #expect(!message.contains("is restarting"), "\(error)")
+        }
+    }
+
+    @Test
     func developerSupportErrorsGiveExactXcodePreparationGuidance() {
         expectNoDifference(
             DeviceHubError.developerImageUnavailable.userFacing,

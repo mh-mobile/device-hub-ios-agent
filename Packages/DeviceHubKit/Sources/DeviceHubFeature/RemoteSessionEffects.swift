@@ -14,18 +14,28 @@ extension RemoteSessionFeature {
         )
     }
 
-    /// Reconnects the selected device after `recoveryDelay` when a session
-    /// ended with an error the app may retry on its own. Errors that need
-    /// the user (pairing, Developer Mode, an unlocked device) wait for them.
+    /// Reconnects the selected device, backing off from `recoveryDelay`,
+    /// when a session ended with an error the app may retry on its own.
+    /// Errors that need the user (pairing, Developer Mode, an unlocked
+    /// device) and a run of failed reconnects wait for them.
+    ///
+    /// Merge it with the ended session's close rather than running it after
+    /// the close: a slow close would otherwise arm this timer late and
+    /// cancel a newer attempt's. `replace` waits for the close regardless.
     func reconnectEffect(
         attemptID: UUID,
-        after error: DeviceHubError?
+        after error: DeviceHubError?,
+        state: State
     ) -> Effect<Action> {
-        guard let error, error.retryability == .automatic else {
+        let attempts = state.reconnectAttempts
+        guard let error,
+              error.retryability == .automatic,
+              attempts < Self.maximumReconnectAttempts
+        else {
             return .none
         }
         return .run { [clock] send in
-            try await clock.sleep(for: Self.recoveryDelay)
+            try await clock.sleep(for: Self.recoveryDelay * (1 << attempts))
             await send(.reconnectTimerFired(attemptID: attemptID))
         }
         .cancellable(id: CancelID.reconnect, cancelInFlight: true)

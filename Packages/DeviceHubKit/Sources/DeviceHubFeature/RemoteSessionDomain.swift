@@ -30,6 +30,8 @@ public extension RemoteSessionFeature {
         public var remediation: DeviceHubRemediation?
         /// Canonical sorted roster of known paired devices.
         public var roster: DeviceRoster
+        /// Automatic reconnects since the last live frame or user retry.
+        public var reconnectAttempts: Int
         /// Stable selection retained across temporary availability loss.
         public var selectedDeviceID: DeviceID?
         /// Ephemeral state for the one connection attempt owned by the feature.
@@ -45,6 +47,7 @@ public extension RemoteSessionFeature {
             lifecycle: DeviceHubAppLifecycle = .active,
             pairing: PairingFeature.State? = nil,
             remediation: DeviceHubRemediation? = nil,
+            reconnectAttempts: Int = 0,
             roster: DeviceRoster = DeviceRoster(),
             selectedDeviceID: DeviceID? = nil,
             session: ActiveRemoteSession? = nil
@@ -58,6 +61,7 @@ public extension RemoteSessionFeature {
             self.lifecycle = lifecycle
             self.pairing = pairing
             self.remediation = remediation
+            self.reconnectAttempts = reconnectAttempts
             self.roster = roster
             self.selectedDeviceID = selectedDeviceID
             self.session = session

@@ -25,6 +25,12 @@ extension RemoteSessionFeature {
                 else {
                     return .none
                 }
+                // With a session the roster is current; reloading it would
+                // mark the live device unreachable until the next snapshot.
+                guard state.session == nil else {
+                    state.isObservingAvailability = true
+                    return observeAvailabilityEffect()
+                }
                 return .send(.task)
 
             case .background:

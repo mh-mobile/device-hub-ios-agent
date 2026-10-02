@@ -17,12 +17,14 @@ public struct RemoteSessionFeature {
         case rosterLoad
     }
 
-    /// Wait before restarting discovery that ended or reconnecting a session
-    /// that failed with an automatically retryable error.
-    ///
-    /// ponytail: fixed delay; a device that keeps failing is retried every
-    /// few seconds. Switch to exponential backoff if that ever costs battery.
+    /// Wait before restarting discovery that ended, and before the first
+    /// automatic reconnect; each further reconnect waits twice as long.
     public static let recoveryDelay: Duration = .seconds(3)
+
+    /// Automatic reconnects in a row before the app waits for the user. A
+    /// failure that repeats deterministically stops after about 90 seconds
+    /// instead of reconnecting forever; a live frame starts the count over.
+    public static let maximumReconnectAttempts = 5
 
     @Dependency(\.backgroundExecution) var backgroundExecution
     @Dependency(\.continuousClock) var clock
