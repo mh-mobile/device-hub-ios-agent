@@ -200,6 +200,7 @@ extension RemoteSessionFeature {
                 if Task.isCancelled {
                     return
                 }
+                AgentBridge.shared.update(session: session, frame: frame)
                 await send(
                     .frameReceived(
                         attemptID: attemptID,

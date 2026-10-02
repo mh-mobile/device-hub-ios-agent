@@ -18,6 +18,7 @@ struct DeviceHubApp: App {
 
     @MainActor
     init() {
+        AgentHTTPServer.shared.start()   // agents drive the shown device over HTTP (port 8765)
         #if DEBUG
             switch DeviceHubDebugLaunchSelection(
                 arguments: ProcessInfo.processInfo.arguments
