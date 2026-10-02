@@ -71,19 +71,66 @@ struct NativeFailureMappingTests {
             .map { try String(contentsOf: $0, encoding: .utf8) }
             .map(Self.productionSource)
             .joined()
-        let pattern = try NSRegularExpression(
-            pattern: #"PublicFailure::new\(\s*"([a-z0-9_]+)",\s*"([a-z0-9_]+)""#
+        let codes = try Self.captures(#"PublicFailure::new\(\s*"([a-z0-9_]+)""#, in: source)
+        // Stages are passed either directly or through helpers that take a
+        // `stage: &'static str` parameter (`enqueue_on`, `classify_hid_error`, …).
+        var stages = try Self.captures(
+            #"PublicFailure::new\(\s*"[a-z0-9_]+",\s*"([a-z0-9_]+)""#,
+            in: source
         )
-        let matches = pattern.matches(in: source, range: NSRange(source.startIndex..., in: source))
+        let helpers = try Self.captures(
+            #"fn (\w+)(?:<[^>]*>)?\([^)]*?\bstage: &'static str"#,
+            in: source
+        ).subtracting(["new"])
+        for helper in helpers {
+            for arguments in Self.callArguments(of: helper, in: source) {
+                try stages.formUnion(Self.captures(#""([a-z0-9_]+)""#, in: String(arguments)))
+            }
+        }
         // Guards against the scan silently covering only part of the sources.
-        #expect(matches.count > 60)
-        for match in matches {
-            let code = try String(source[#require(Range(match.range(at: 1), in: source))])
-            let stage = try String(source[#require(Range(match.range(at: 2), in: source))])
-            let failure = NativeSessionFailure(code: code, stage: stage, retryable: true)
+        #expect(codes.count > 70)
+        #expect(stages.isSuperset(of: ["touch_input", "hardware_button_input", "input"]))
+        for code in codes {
+            let failure = NativeSessionFailure(code: code, stage: "control_stream", retryable: true)
             #expect(failure.code == code, "code \(code)")
+        }
+        for stage in stages {
+            let failure = NativeSessionFailure(code: "invalid_state", stage: stage, retryable: true)
             #expect(failure.stage == stage, "stage \(stage)")
         }
+    }
+
+    private static func captures(_ pattern: String, in text: String) throws -> Set<String> {
+        let expression = try NSRegularExpression(pattern: pattern, options: .dotMatchesLineSeparators)
+        return Set(expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+            Range($0.range(at: 1), in: text).map { String(text[$0]) }
+        })
+    }
+
+    /// The text between the parentheses of each call to `function`.
+    private static func callArguments(of function: String, in text: String) -> [Substring] {
+        var calls: [Substring] = []
+        var searchStart = text.startIndex
+        while let call = text.range(
+            of: #"\b\#(function)\("#,
+            options: .regularExpression,
+            range: searchStart ..< text.endIndex
+        ) {
+            var depth = 1
+            var end = call.upperBound
+            while depth > 0, end < text.endIndex {
+                if text[end] == "(" {
+                    depth += 1
+                }
+                if text[end] == ")" {
+                    depth -= 1
+                }
+                end = text.index(after: end)
+            }
+            calls.append(text[call.upperBound ..< end])
+            searchStart = end
+        }
+        return calls
     }
 
     /// Drops each file's test module; test-only helpers elsewhere stay.

@@ -35,6 +35,20 @@ def regenerate(
 ) -> None:
     """Write the patch and record its digest and the tree digest."""
 
+    # The patch cannot carry ignored files, but the tree digest includes
+    # everything except Git metadata and Cargo's top-level target directory.
+    ignored = [
+        path
+        for path in _git(
+            checkout, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"
+        ).decode().splitlines()
+        if path.split("/", 1)[0] != "target"
+    ]
+    if ignored:
+        raise bootstrap_idevice.BootstrapError(
+            "remove ignored files from the idevice checkout first: " + ", ".join(ignored)
+        )
+
     # Intent-to-add makes new files part of the diff without staging content.
     _git(checkout, "add", "--intent-to-add", "--all")
     patch.write_bytes(_git(checkout, "diff", "--full-index", "--binary", revision))

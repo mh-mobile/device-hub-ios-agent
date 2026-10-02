@@ -63,6 +63,44 @@ class RegenerateIdevicePatchTests(unittest.TestCase):
             self.git(clean, "apply", str(patch))
             self.assertEqual(bootstrap_idevice.tree_digest(clean), tree_sha)
 
+    def test_ignored_files_stop_regeneration(self) -> None:
+        # The patch cannot carry ignored files, but the tree digest would
+        # include them, so a fresh bootstrap could never match it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "idevice"
+            checkout.mkdir()
+            self.git(checkout, "init", "-q", "-b", "main")
+            self.git(checkout, "config", "user.email", "ci@example.com")
+            self.git(checkout, "config", "user.name", "CI Test")
+            self.git(checkout, "config", "commit.gpgsign", "false")
+            (checkout / ".gitignore").write_text("*.pcap\n/target\n")
+            (checkout / "lib.rs").write_text("fn upstream() {}\n")
+            self.git(checkout, "add", ".")
+            self.git(checkout, "commit", "-q", "-m", "upstream")
+            revision = self.git(checkout, "rev-parse", "HEAD").strip()
+            (checkout / "lib.rs").write_text("fn patched() {}\n")
+            (checkout / "target").mkdir()
+            (checkout / "target" / "build.o").write_text("cargo output\n")
+            source = root / "bootstrap_idevice.py"
+            original = 'IDEVICE_PATCH_SHA256 = (\n    "old"\n)\nIDEVICE_TREE_SHA256 = "old"\n'
+            source.write_text(original)
+            arguments = dict(
+                checkout=checkout,
+                revision=revision,
+                patch=root / "idevice.patch",
+                bootstrap_source=source,
+            )
+
+            (checkout / "capture.pcap").write_text("packets\n")
+            with self.assertRaisesRegex(bootstrap_idevice.BootstrapError, "capture.pcap"):
+                regenerate_idevice_patch.regenerate(**arguments)
+            self.assertEqual(source.read_text(), original)
+
+            # Cargo's target directory is outside the digest, so it is fine.
+            (checkout / "capture.pcap").unlink()
+            regenerate_idevice_patch.regenerate(**arguments)
+
     def test_the_committed_patch_matches_the_bootstrap_contract(self) -> None:
         specification = bootstrap_idevice.default_specification()
         self.assertEqual(
