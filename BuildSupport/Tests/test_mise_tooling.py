@@ -43,6 +43,16 @@ class MiseToolingContractTests(unittest.TestCase):
         for script in task_scripts(configuration, task_names):
             self.assertNotIn("DeviceHubPrivateMedia/Tests/run-tests.sh", script)
 
+    def test_swift_package_scripts_use_the_selected_xcode_toolchain(self) -> None:
+        # A swift on PATH (swiftly, Homebrew) may predate the package's tools
+        # version; xcrun resolves the same toolchain xcodebuild uses.
+        for name in ("test-core.sh", "render-local-previews.sh"):
+            script = (ROOT / "Scripts" / name).read_text()
+            for line in script.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("swift test", "swift run")):
+                    self.fail(f"{name}: {stripped}")
+
     def test_ios_only_package_tests_run_in_the_simulator(self) -> None:
         script = (ROOT / "Scripts" / "test-app.sh").read_text()
 

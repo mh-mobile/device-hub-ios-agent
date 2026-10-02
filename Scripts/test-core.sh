@@ -14,4 +14,4 @@ if [[ -n "$SCRATCH_PATH" ]]; then
   TEST_ARGUMENTS+=(--scratch-path "$SCRATCH_PATH")
 fi
 
-swift test "${TEST_ARGUMENTS[@]}"
+xcrun swift test "${TEST_ARGUMENTS[@]}"
