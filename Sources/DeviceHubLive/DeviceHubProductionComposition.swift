@@ -1,4 +1,5 @@
 import DeviceHubTransport
+import Foundation
 
 /// Owns the shipping transport values that make Device Hub appear as a
 /// compatible Pairable Host to an iOS target.
@@ -44,6 +45,10 @@ public enum DeviceHubProductionComposition {
             suffix.append(character)
             suffixByteCount += characterByteCount
         }
-        return controllerNamePrefix + suffix
+        // A cut right after a space would leave trailing whitespace, which
+        // the transport rejects as invalid display text.
+        return (controllerNamePrefix + suffix).trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
     }
 }

@@ -71,6 +71,21 @@ struct DeviceHubProductionCompositionTests {
         )
     }
 
+    @Test("Truncating a long name never leaves trailing whitespace")
+    func truncationAtWordBoundary() throws {
+        // The 128-byte cut lands right after the space.
+        let name = String(repeating: "a", count: 109) + " bbbb"
+        let configuration =
+            try DeviceHubProductionComposition.makeTransportConfiguration(
+                controllerDeviceName: name
+            )
+
+        #expect(
+            configuration.controllerDisplayName
+                == "Device Hub App in " + String(repeating: "a", count: 109)
+        )
+    }
+
     @Test("Long device names remain valid Bonjour TXT values")
     func longControllerDeviceName() throws {
         let configuration =

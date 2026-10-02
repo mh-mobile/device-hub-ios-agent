@@ -71,8 +71,10 @@ public struct DeviceHubTransportConfiguration: Equatable, Sendable {
             !trimmedValue.isEmpty,
             value == trimmedValue,
             value.utf8.count <= maximumUTF8Length,
+            // Only C0/C1 controls (Cc), as in Rust: format characters
+            // such as the ZWJ in emoji names are valid display text.
             value.unicodeScalars.allSatisfy({
-                !CharacterSet.controlCharacters.contains($0)
+                $0.properties.generalCategory != .control
             })
         else {
             throw NativeSessionContractError.invalidText
