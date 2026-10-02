@@ -4255,7 +4255,7 @@ index a75f1f58d4c7126dfa5c4cd5b2e33fdf18820916..c316db33ec92bde42eb6fca30d619e7f
  /// `negotiator_offer` is the zlib+protobuf blob
  /// from [`super::negotiation::MediaNegotiationBlob::to_negotiator_offer`].
 diff --git a/idevice/src/services/core_device/display_stream/hevc.rs b/idevice/src/services/core_device/display_stream/hevc.rs
-index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63dbac9f7790 100644
+index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c979450b3483e 100644
 --- a/idevice/src/services/core_device/display_stream/hevc.rs
 +++ b/idevice/src/services/core_device/display_stream/hevc.rs
 @@ -5,7 +5,9 @@
@@ -4269,10 +4269,15 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
  
  const HEVC_NAL_HEADER_LEN: usize = 2;
  
-@@ -26,6 +28,20 @@ const NAL_TYPE_VCL_HIGH: u8 = 31;
+@@ -25,7 +27,24 @@ const NAL_TYPE_VCL_HIGH: u8 = 31;
+ 
  const AUD_NAL: [u8; 3] = [0x46, 0x01, 0x50];
  const ANNEXB_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
- const MAX_REORDER_BUFFER: usize = 128;
+-const MAX_REORDER_BUFFER: usize = 128;
++// The transport is a TCP tunnel: packets never arrive out of order, so a missing
++// sequence number is lost for good. Waiting for 128 later packets before calling
++// the gap only delays the keyframe request and stalls the picture for seconds.
++const MAX_REORDER_BUFFER: usize = 2;
 +const MAX_REORDER_BYTES: usize = 4 * 1024 * 1024;
 +const MAX_NAL_UNIT_SIZE: usize = 16 * 1024 * 1024;
 +const MAX_PARAMETER_SET_SIZE: usize = 1024 * 1024;
@@ -4290,7 +4295,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
  
  #[inline]
  fn nal_type(nal_header_byte0: u8) -> u8 {
-@@ -42,15 +58,18 @@ fn is_vcl(t: u8) -> bool {
+@@ -42,15 +61,18 @@ fn is_vcl(t: u8) -> bool {
      t <= NAL_TYPE_VCL_HIGH
  }
  
@@ -4313,7 +4318,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
  
      vps: Option<Vec<u8>>,
      sps: Option<Vec<u8>>,
-@@ -60,12 +79,33 @@ pub struct HevcDepacketizer {
+@@ -60,12 +82,33 @@ pub struct HevcDepacketizer {
      out: Vec<u8>,
  }
  
@@ -4347,7 +4352,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
          if self.next_seq.is_none() {
              self.next_seq = Some(seq);
          }
-@@ -78,12 +118,21 @@ impl HevcDepacketizer {
+@@ -78,12 +121,21 @@ impl HevcDepacketizer {
              return;
          }
  
@@ -4371,7 +4376,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
          {
              // A lost packet breaks any in-flight fragment.
              self.reset_fu();
-@@ -98,6 +147,7 @@ impl HevcDepacketizer {
+@@ -98,6 +150,7 @@ impl HevcDepacketizer {
              let Some((ts, payload)) = self.reorder.remove(&next) else {
                  break;
              };
@@ -4379,7 +4384,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
              // A timestamp change marks a new access unit (frame). Close the
              // previous picture by emitting an AUD before the new one's NALs, so
              // the decoder doesn't merge slices from different frames together.
-@@ -107,79 +157,20 @@ impl HevcDepacketizer {
+@@ -107,79 +160,20 @@ impl HevcDepacketizer {
                  self.write_annexb(&AUD_NAL);
              }
              self.last_ts = Some(ts);
@@ -4467,7 +4472,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
          }
      }
  
-@@ -241,13 +232,39 @@ impl HevcDepacketizer {
+@@ -241,13 +235,39 @@ impl HevcDepacketizer {
      }
  
      fn write_annexb(&mut self, nal: &[u8]) {
@@ -4509,7 +4514,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..548f4d8cf8099c8655f2aa8858df63db
      }
  
      /// Drain and return all Annex-B output accumulated so far.
-@@ -268,3 +285,2068 @@ fn seq_less_than(a: u16, b: u16) -> bool {
+@@ -268,3 +288,2068 @@ fn seq_less_than(a: u16, b: u16) -> bool {
      let diff = b.wrapping_sub(a);
      diff != 0 && diff < 0x8000
  }

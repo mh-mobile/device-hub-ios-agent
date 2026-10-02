@@ -1293,6 +1293,9 @@ struct VideoFeedbackState {
     highest_extended_sequence_number: u32,
     media_ssrc: u32,
     our_ssrc: u32,
+    received_packets: u32,
+    // (expected, received) at the previous report, for the interval's fraction lost.
+    previous_report: (u32, u32),
 }
 
 impl VideoFeedbackState {
@@ -1304,6 +1307,8 @@ impl VideoFeedbackState {
             highest_extended_sequence_number: 0,
             media_ssrc,
             our_ssrc,
+            received_packets: 0,
+            previous_report: (0, 0),
         }
     }
 
@@ -1329,12 +1334,26 @@ impl VideoFeedbackState {
         datagrams
     }
 
-    fn periodic_report(&self) -> Option<Vec<u8>> {
+    /// RR with real loss figures: the encoder lowers its bitrate when it sees
+    /// loss, which keeps heavy motion from overflowing the tunnel.
+    fn periodic_report(&mut self) -> Option<Vec<u8>> {
         let base = self.base_sequence_number?;
+        let expected = self.highest_extended_sequence_number.wrapping_add(1);
+        let cumulative_lost = expected.saturating_sub(self.received_packets);
+        let (previous_expected, previous_received) = self.previous_report;
+        let expected_interval = expected.wrapping_sub(previous_expected);
+        let lost_interval =
+            expected_interval.saturating_sub(self.received_packets.wrapping_sub(previous_received));
+        self.previous_report = (expected, self.received_packets);
+        let fraction_lost = if expected_interval == 0 {
+            0
+        } else {
+            ((u64::from(lost_interval) << 8) / u64::from(expected_interval)).min(255) as u8
+        };
         let block = ReportBlock {
             source_ssrc: self.media_ssrc,
-            fraction_lost: 0,
-            cumulative_lost: 0,
+            fraction_lost,
+            cumulative_lost: cumulative_lost.min(0x7f_ffff),
             highest_seq: u32::from(base).wrapping_add(self.highest_extended_sequence_number),
             jitter: 0,
             lsr: 0,
@@ -1344,6 +1363,7 @@ impl VideoFeedbackState {
     }
 
     fn observe_sequence_number(&mut self, sequence_number: u16) {
+        self.received_packets = self.received_packets.wrapping_add(1);
         let Some(base) = self.base_sequence_number else {
             self.base_sequence_number = Some(sequence_number);
             self.highest_extended_sequence_number = 0;
@@ -3460,14 +3480,14 @@ mod tests {
             feedback.consume(&first).is_empty(),
             "no per-frame ACK: it desyncs the encoder under motion"
         );
-        let report = |highest_seq| {
+        let report = |highest_seq, fraction_lost, cumulative_lost| {
             Some(build_liveness(
                 our_ssrc,
                 call_id,
                 &[ReportBlock {
                     source_ssrc: device_ssrc,
-                    fraction_lost: 0,
-                    cumulative_lost: 0,
+                    fraction_lost,
+                    cumulative_lost,
                     highest_seq,
                     jitter: 0,
                     lsr: 0,
@@ -3475,7 +3495,10 @@ mod tests {
                 }],
             ))
         };
-        assert_eq!(feedback.periodic_report(), report(u32::from(u16::MAX - 1)));
+        assert_eq!(
+            feedback.periodic_report(),
+            report(u32::from(u16::MAX - 1), 0, 0)
+        );
 
         let wrapped = VideoDatagramOutcome {
             highest_sequence_number: Some(0),
@@ -3494,8 +3517,8 @@ mod tests {
         );
         assert_eq!(
             feedback.periodic_report(),
-            report(0x1_0000),
-            "the extended sequence number carries the wraparound"
+            report(0x1_0000, 128, 1),
+            "the wraparound is extended and the skipped packet is reported lost"
         );
     }
 
