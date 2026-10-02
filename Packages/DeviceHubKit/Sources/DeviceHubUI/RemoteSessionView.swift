@@ -42,6 +42,21 @@ struct RemoteSessionView: View {
         case .nativeToolbar:
             canvas(screenInset: chromeLayout.screenInset)
 
+        case .floatingTrailingRail where showsLandscapeTarget:
+            // A landscape target fills the width, leaving no pillarboxes for
+            // floating chrome; give the header and rail their own space so
+            // they never cover tappable remote pixels.
+            VStack(alignment: .leading, spacing: 6) {
+                floatingHeader
+                HStack(spacing: 8) {
+                    canvas(screenInset: 0)
+                    if store.selectedDevice != nil {
+                        controls()
+                    }
+                }
+            }
+            .padding(8)
+
         case .floatingTrailingRail:
             canvas(screenInset: chromeLayout.screenInset)
                 .overlay(alignment: .topLeading) {
@@ -72,6 +87,16 @@ struct RemoteSessionView: View {
             .padding(.top, chromeLayout.topChromePadding)
             .padding(.bottom, 8)
         }
+    }
+
+    /// Whether the remote picture is wider than tall in its displayed
+    /// orientation.
+    private var showsLandscapeTarget: Bool {
+        guard let metadata = store.session?.frame?.metadata else {
+            return false
+        }
+        let displayed = metadata.orientation.orientedSize(for: metadata.pixelSize)
+        return displayed.width > displayed.height
     }
 
     private func canvas(screenInset: CGFloat) -> some View {

@@ -55,6 +55,7 @@
         case connectingIPhoneLight
         case liveIPhoneDark
         case liveLandscapeIPadTargetIPhoneDark
+        case liveLandscapeIPhoneTargetLandscapeDark
         case offlineIPhoneDark
         case sessionEndedIPhoneDark
         case lockedIPhoneAccessibility
@@ -228,6 +229,15 @@
                     device: devices.landscapeIPad,
                     presentation: .live,
                     remoteScreen: .tabletLandscape
+                )
+
+            case .liveLandscapeIPhoneTargetLandscapeDark:
+                // Both phones landscape: no pillarboxes for floating chrome.
+                return try sessionState(
+                    roster: roster,
+                    device: reachableDevice,
+                    presentation: .live,
+                    remoteScreen: .phoneLandscape
                 )
 
             case .offlineIPhoneDark:
