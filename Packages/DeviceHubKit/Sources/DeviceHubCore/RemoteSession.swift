@@ -309,15 +309,14 @@ public struct RemoteSessionState: Equatable, Sendable {
             guard metadata.generation == generation else {
                 return .rejectedStaleGeneration
             }
-            if let latestScreen {
-                guard metadata.receivedAt >= latestScreen.receivedAt else {
+            // Order frames by their sequence, never by wall-clock arrival
+            // time: a clock correction would otherwise freeze the picture
+            // while input stayed authorized against the stale frame. Video
+            // always supersedes the one screenshot taken before streaming.
+            if case let .videoFrame(currentFrame) = latestScreen {
+                guard metadata.sequenceNumber > currentFrame.sequenceNumber
+                else {
                     return .rejectedOutOfOrderMedia
-                }
-                if case let .videoFrame(currentFrame) = latestScreen {
-                    guard metadata.sequenceNumber > currentFrame.sequenceNumber
-                    else {
-                        return .rejectedOutOfOrderMedia
-                    }
                 }
             }
             latestScreen = .videoFrame(metadata)

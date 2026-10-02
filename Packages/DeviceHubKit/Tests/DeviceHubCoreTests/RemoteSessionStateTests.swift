@@ -227,6 +227,29 @@ extension RemoteSessionStateTests {
         #expect(state.latestScreen == nil)
     }
 
+    @Test("a newer frame is accepted even if the wall clock moved backwards")
+    func videoOrderIgnoresWallClock() {
+        var state = readyState()
+        let newerFrame = FrameMetadata(
+            generation: generation,
+            sequenceNumber: 2,
+            receivedAt: now.addingTimeInterval(-60),
+            pixelSize: PixelSize(width: 1179, height: 2556),
+            orientation: .portrait
+        )
+
+        expectNoDifference(
+            state.apply(
+                SessionUpdate(
+                    generation: generation,
+                    event: .videoFrame(newerFrame)
+                )
+            ),
+            .accepted
+        )
+        expectNoDifference(state.latestScreen, .videoFrame(newerFrame))
+    }
+
     @Test
     func outOfOrderMediaCannotReplaceANewerFrame() {
         var state = readyState()
