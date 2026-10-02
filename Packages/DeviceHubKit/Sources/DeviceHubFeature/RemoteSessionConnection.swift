@@ -37,7 +37,8 @@ extension RemoteSessionFeature {
             state.session = session
             return .concatenate(
                 closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                reconnectEffect(attemptID: attemptID, after: .connectionLost)
             )
 
         case let .sessionStreamFailed(attemptID, sessionID, error):
@@ -57,7 +58,8 @@ extension RemoteSessionFeature {
             state.session = session
             return .concatenate(
                 closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                reconnectEffect(attemptID: attemptID, after: error)
             )
 
         case let .sessionUpdateReceived(attemptID, sessionID, update):
@@ -113,7 +115,7 @@ extension RemoteSessionFeature {
             session.sessionID = nil
             state.remediation = DeviceHubRemediation(error: error)
             state.session = session
-            return .none
+            return reconnectEffect(attemptID: attemptID, after: error)
 
         case let .success(openedSession):
             DeviceHubFeatureTrace.emit("connection_opened")
@@ -167,7 +169,11 @@ extension RemoteSessionFeature {
             state.activeContactIDs.removeAll()
             return .concatenate(
                 closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                reconnectEffect(
+                    attemptID: session.attemptID,
+                    after: session.connectionError
+                )
             )
         }
         guard wasAcceptingInput, !session.acceptsInput else {

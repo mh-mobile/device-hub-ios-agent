@@ -9,8 +9,26 @@ extension RemoteSessionFeature {
             .cancel(id: CancelID.commands),
             .cancel(id: CancelID.connect),
             .cancel(id: CancelID.frames),
-            .cancel(id: CancelID.lifecycle)
+            .cancel(id: CancelID.lifecycle),
+            .cancel(id: CancelID.reconnect)
         )
+    }
+
+    /// Reconnects the selected device after `recoveryDelay` when a session
+    /// ended with an error the app may retry on its own. Errors that need
+    /// the user (pairing, Developer Mode, an unlocked device) wait for them.
+    func reconnectEffect(
+        attemptID: UUID,
+        after error: DeviceHubError?
+    ) -> Effect<Action> {
+        guard let error, error.retryability == .automatic else {
+            return .none
+        }
+        return .run { [clock] send in
+            try await clock.sleep(for: Self.recoveryDelay)
+            await send(.reconnectTimerFired(attemptID: attemptID))
+        }
+        .cancellable(id: CancelID.reconnect, cancelInFlight: true)
     }
 
     func connectEffect(

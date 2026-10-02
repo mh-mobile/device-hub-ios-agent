@@ -296,6 +296,8 @@ struct RemoteSessionFeatureTests {
                 )
             ) {
                 RemoteSessionFeature()
+            } withDependencies: {
+                $0.continuousClock = TestClock()
             }
             await store.send(
                 .sessionStreamFailed(
@@ -307,6 +309,9 @@ struct RemoteSessionFeatureTests {
                 $0.remediation = DeviceHubRemediation(error: error)
                 $0.session?.connectionError = error
                 $0.session?.sessionID = nil
+            }
+            if error.retryability == .automatic {
+                await store.skipInFlightEffects()
             }
         }
     }
@@ -330,6 +335,7 @@ struct RemoteSessionFeatureTests {
         ) {
             RemoteSessionFeature()
         } withDependencies: {
+            $0.continuousClock = TestClock()
             $0.date.now = time
         }
 
@@ -356,6 +362,7 @@ struct RemoteSessionFeatureTests {
             )
         )
         #expect(!store.state.acceptsInput)
+        await store.skipInFlightEffects()
     }
 
     @Test("Backgrounding clears pixels, pairing codes, and held input")

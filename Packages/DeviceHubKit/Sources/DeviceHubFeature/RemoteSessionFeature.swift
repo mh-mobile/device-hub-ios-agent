@@ -8,14 +8,24 @@ import Foundation
 public struct RemoteSessionFeature {
     enum CancelID {
         case availability
+        case availabilityRestart
         case commands
         case connect
         case frames
         case lifecycle
+        case reconnect
         case rosterLoad
     }
 
+    /// Wait before restarting discovery that ended or reconnecting a session
+    /// that failed with an automatically retryable error.
+    ///
+    /// ponytail: fixed delay; a device that keeps failing is retried every
+    /// few seconds. Switch to exponential backoff if that ever costs battery.
+    public static let recoveryDelay: Duration = .seconds(3)
+
     @Dependency(\.backgroundExecution) var backgroundExecution
+    @Dependency(\.continuousClock) var clock
     @Dependency(\.date) var date
     @Dependency(\.deviceHub) var deviceHub
     @Dependency(\.uuid) var uuid

@@ -126,8 +126,8 @@ public struct DeviceHubView: View {
                 externalRemediationChanged
             )
             .modifier(
-                PairingScreenIdleTimerModifier(
-                    isDisabled: pairingScreenIdleTimerDisabled
+                ScreenIdleTimerModifier(
+                    isDisabled: screenIdleTimerDisabled
                 )
             )
             .task {
@@ -183,10 +183,11 @@ public struct DeviceHubView: View {
         )
     }
 
-    private var pairingScreenIdleTimerDisabled: Bool {
-        PairingScreenIdlePolicy.isDisabled(
+    private var screenIdleTimerDisabled: Bool {
+        ScreenIdlePolicy.isDisabled(
             isPairingPresented: store.pairing != nil,
-            hasRemediation: store.pairing?.remediation != nil,
+            hasPairingRemediation: store.pairing?.remediation != nil,
+            presentation: store.session?.presentation,
             scenePhase: scenePhase
         )
     }
@@ -283,24 +284,32 @@ public struct DeviceHubView: View {
     }
 }
 
-/// Decides when an explicit pairing attempt must outlive normal Auto-Lock.
+/// Decides when the controller must outlive normal Auto-Lock.
 ///
-/// Error recovery and non-active scenes release the lease so an abandoned
-/// sheet cannot keep the controller awake indefinitely.
-enum PairingScreenIdlePolicy {
+/// A remote screen on display stays awake: Auto-Lock would background the
+/// app and end the session, even while an agent drives it without touches.
+/// An explicit pairing attempt stays awake until it needs recovery. Ended,
+/// offline, and non-active states release the lease so an abandoned screen
+/// cannot keep the controller awake indefinitely.
+enum ScreenIdlePolicy {
     static func isDisabled(
         isPairingPresented: Bool,
-        hasRemediation: Bool,
+        hasPairingRemediation: Bool,
+        presentation: RemoteSessionPresentation?,
         scenePhase: ScenePhase
     ) -> Bool {
-        isPairingPresented
-            && !hasRemediation
-            && scenePhase == .active
+        guard scenePhase == .active else {
+            return false
+        }
+        if isPairingPresented {
+            return !hasPairingRemediation
+        }
+        return presentation == .live || presentation == .viewingOnly
     }
 }
 
-/// Applies the pairing-specific idle-timer lease at the UIKit shell boundary.
-private struct PairingScreenIdleTimerModifier: ViewModifier {
+/// Applies the idle-timer lease at the UIKit shell boundary.
+private struct ScreenIdleTimerModifier: ViewModifier {
     let isDisabled: Bool
 
     func body(content: Content) -> some View {

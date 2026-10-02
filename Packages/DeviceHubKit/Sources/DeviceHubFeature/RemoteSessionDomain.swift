@@ -165,6 +165,7 @@ public extension RemoteSessionFeature {
         case pairing(PresentationAction<PairingFeature.Action>)
         case remediationButtonTapped
         case remediationDismissed
+        case reconnectTimerFired(attemptID: UUID)
         case retrySelectedDevice
         case rotateRightButtonTapped
         case sessionEventsFinished(

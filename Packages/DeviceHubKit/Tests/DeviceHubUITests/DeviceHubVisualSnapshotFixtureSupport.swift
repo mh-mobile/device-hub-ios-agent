@@ -74,6 +74,7 @@
                  .liveIPhoneDark,
                  .liveLandscapeIPadTargetIPhoneDark,
                  .offlineIPhoneDark,
+                 .sessionEndedIPhoneDark,
                  .noticesUnavailableIPhoneDark,
                  .developerImageIncompatibleIPhoneDark,
                  .localNetworkDeniedIPadDark,

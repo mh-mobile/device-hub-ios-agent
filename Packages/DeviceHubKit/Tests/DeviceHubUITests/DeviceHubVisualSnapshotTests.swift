@@ -56,6 +56,7 @@
         case liveIPhoneDark
         case liveLandscapeIPadTargetIPhoneDark
         case offlineIPhoneDark
+        case sessionEndedIPhoneDark
         case lockedIPhoneAccessibility
         case developerModeIPadAccessibility
         case localNetworkDeniedIPadDark
@@ -233,6 +234,21 @@
                 return RemoteSessionFeature.State(
                     roster: roster,
                     selectedDeviceID: devices.offline.id
+                )
+
+            case .sessionEndedIPhoneDark:
+                // The remediation was dismissed; the canvas must still offer
+                // a way back instead of an endless spinner.
+                var session = ActiveRemoteSession(
+                    attemptID: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9)),
+                    device: reachableDevice,
+                    evaluatedAt: Date(timeIntervalSince1970: 0)
+                )
+                session.connectionError = .connectionLost
+                return RemoteSessionFeature.State(
+                    roster: roster,
+                    selectedDeviceID: reachableDevice.id,
+                    session: session
                 )
 
             case .lockedIPhoneAccessibility:

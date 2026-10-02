@@ -17,7 +17,12 @@ extension RemoteSessionFeature {
 
             switch lifecycle {
             case .active:
-                guard previousLifecycle == .background else {
+                // iOS returns from background through inactive, so the
+                // previous phase alone cannot tell whether work stopped;
+                // backgrounding always ends availability observation.
+                guard previousLifecycle != .active,
+                      !state.isObservingAvailability
+                else {
                     return .none
                 }
                 return .send(.task)
@@ -60,7 +65,14 @@ extension RemoteSessionFeature {
 
         case .availabilityObservationFinished:
             state.isObservingAvailability = false
-            return .none
+            guard state.lifecycle == .active else {
+                return .none
+            }
+            return .run { [clock] send in
+                try await clock.sleep(for: Self.recoveryDelay)
+                await send(.task)
+            }
+            .cancellable(id: CancelID.availabilityRestart, cancelInFlight: true)
 
         case .task:
             guard state.lifecycle == .active else {
@@ -104,6 +116,7 @@ extension RemoteSessionFeature {
         .merge(
             cancelSessionEffects(),
             .cancel(id: CancelID.availability),
+            .cancel(id: CancelID.availabilityRestart),
             .cancel(id: CancelID.rosterLoad)
         )
     }

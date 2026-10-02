@@ -85,6 +85,7 @@ struct RemoteSessionView: View {
                 remediation: store.remediation,
                 screenInset: screenInset,
                 pairButtonTapped: pairButtonTapped,
+                reconnectButtonTapped: reconnectButtonTapped,
                 remediationButtonTapped: remediationButtonTapped,
                 remediationDismissed: remediationDismissed,
                 startViewingButtonTapped: startViewingButtonTapped,

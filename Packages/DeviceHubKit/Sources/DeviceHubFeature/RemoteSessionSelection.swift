@@ -46,6 +46,23 @@ extension RemoteSessionFeature {
                 return .none
             }
 
+        case let .reconnectTimerFired(attemptID):
+            guard state.lifecycle == .active,
+                  !state.isViewingStopped,
+                  let session = state.session,
+                  session.attemptID == attemptID,
+                  session.sessionID == nil,
+                  session.connectionError != nil,
+                  let device = state.selectedDevice,
+                  device.id == session.device.id
+            else {
+                return .none
+            }
+            return beginSessionIfPossible(
+                state: &state,
+                device: device
+            )
+
         case .retrySelectedDevice:
             guard let device = state.selectedDevice else {
                 return .none
