@@ -169,6 +169,26 @@ struct PairingPersistenceTests {
         #expect(repeatedCommit == committed)
     }
 
+    @Test("a clock that moved backwards after M5 still commits M6")
+    func commitAfterClockCorrection() async throws {
+        let store = try makeStore(driver: MemoryKeychainDriver())
+        let verifiedAt = Date(timeIntervalSince1970: 1_750_000_000)
+        let verified = try fixtureVerifiedM5(verifiedAt: verifiedAt)
+        _ = try await store.saveVerifiedM5(verified)
+
+        let committed = try await store.commitM6(
+            for: verified.deviceID,
+            committedAt: verifiedAt.addingTimeInterval(-60)
+        )
+
+        #expect(
+            committed.completion == .committedAfterM6(
+                verifiedAt: verifiedAt,
+                committedAt: verifiedAt
+            )
+        )
+    }
+
     @Test("the decoder distinguishes unknown schemas from corrupt payloads")
     func schemaAndCorruptionFailures() async throws {
         let driver = MemoryKeychainDriver()
