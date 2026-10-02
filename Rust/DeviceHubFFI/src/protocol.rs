@@ -665,7 +665,7 @@ async fn run_control_stream(
             },
         };
         update_geometry_orientation(&mut video.geometry, &initial_orientation)?;
-        let _audio_udp = audio_udp;
+        let mut audio_open = true;
         let mut cleanup = InputCleanupState::default();
         let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
         tokio::pin!(first_video_frame_deadline);
@@ -689,6 +689,22 @@ async fn run_control_stream(
                 changed = cancellation.changed() => {
                     let _ = changed;
                     break Ok(());
+                }
+                // Device audio: each RTP payload is one raw AAC-ELD frame. Handed to
+                // the controller through the datagram event, which the app plays.
+                datagram = audio_udp.recv(), if audio_open => {
+                    match datagram {
+                        Ok(datagram) if !is_rtcp(&datagram.data) => {
+                            if let Ok(packet) = RtpPacket::parse_checked(&datagram.data) {
+                                let _ = media.video_datagram(
+                                    packet.payload.to_vec(),
+                                    datagram.source_port,
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => audio_open = false,
+                    }
                 }
                 datagram = video_udp.recv() => {
                     match datagram {

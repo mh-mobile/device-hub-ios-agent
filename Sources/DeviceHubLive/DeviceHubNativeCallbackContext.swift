@@ -35,6 +35,8 @@ final class DeviceHubNativeCallbackContext: @unchecked Sendable {
     )
 
     private let avConference: DeviceHubAVConferenceSession?
+    /// Created on the first audio payload; nil if the audio engine is unavailable.
+    private lazy var audioPlayer = DeviceHubAudioPlayer()
     private var controlDecoder: DeviceHubNativeEventDecoder
     private let controlContinuation:
         AsyncThrowingStream<NativeSessionEvent, Error>.Continuation
@@ -182,7 +184,8 @@ final class DeviceHubNativeCallbackContext: @unchecked Sendable {
 
     private func handleDatagram(_ datagram: DeviceHubNativeVideoDatagram) {
         guard let avConference else {
-            fail(videoDatagramFailure)
+            // Without the AVConference path, datagrams carry device audio.
+            audioPlayer?.enqueue(datagram.bytes)
             return
         }
         do {

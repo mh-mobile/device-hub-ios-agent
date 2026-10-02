@@ -475,13 +475,8 @@ impl MediaEmitter {
         Ok(())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "ABI v3 retains the retired raw-datagram media callback"
-        )
-    )]
+    /// Carries device audio payloads (raw AAC-ELD frames); the ABI v3 name is
+    /// kept from the retired raw-video-datagram path.
     pub(crate) fn video_datagram(
         &self,
         bytes: Vec<u8>,
