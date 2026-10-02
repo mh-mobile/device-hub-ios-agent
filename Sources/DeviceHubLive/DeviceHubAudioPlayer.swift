@@ -13,6 +13,14 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
         category: "audio"
     )
     private static let audioSpecificConfig = Data([0xF8, 0xE8, 0x50, 0x00])
+    /// Frames queued but not yet played, in 480-sample (~11 ms) buffers. Packets
+    /// arrive in bursts after network hiccups; past this the newest audio is
+    /// dropped instead of queued, so latency cannot build up.
+    // ponytail: fixed cap; raise it if steady streams start dropping audio.
+    private static let maximumQueuedBuffers = 16
+    /// After running dry, wait for this many buffers (~55 ms) before resuming, so
+    /// network jitter becomes one short gap instead of constant stutter.
+    private static let resumeThreshold = 5
 
     private let queue = DispatchQueue(label: "DeviceHub.audio")
     private let engine = AVAudioEngine()
@@ -22,6 +30,8 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
     private let converter: AVAudioConverter
     private var packets = 0
     private var lastWasSilent: Bool?
+    private var queuedBuffers = 0
+    private var held: [AVAudioPCMBuffer] = []
 
     init?() {
         var description = AudioStreamBasicDescription(
@@ -53,6 +63,7 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
 
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            try? AVAudioSession.sharedInstance().setPreferredIOBufferDuration(0.005)
             try AVAudioSession.sharedInstance().setActive(true)
             engine.attach(player)
             engine.connect(player, to: engine.mainMixerNode, format: pcmFormat)
@@ -118,9 +129,31 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
                     + "engine=\(engine.isRunning) playing=\(player.isPlaying)"
             )
         }
-        guard status != .error, output.frameLength > 0 else {
+        // Always decode (the decoder is stateful); only skip playing when behind.
+        guard
+            status != .error,
+            output.frameLength > 0,
+            queuedBuffers < Self.maximumQueuedBuffers
+        else {
             return
         }
-        player.scheduleBuffer(output)
+        if queuedBuffers == 0 {
+            held.append(output)
+            guard held.count >= Self.resumeThreshold else {
+                return
+            }
+            held.forEach(schedule)
+            held.removeAll()
+        } else {
+            schedule(output)
+        }
+    }
+
+    private func schedule(_ buffer: AVAudioPCMBuffer) {
+        queuedBuffers += 1
+        player.scheduleBuffer(buffer) { [weak self] in
+            guard let self else { return }
+            queue.async { self.queuedBuffers -= 1 }
+        }
     }
 }
