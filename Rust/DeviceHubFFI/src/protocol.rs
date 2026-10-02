@@ -61,6 +61,9 @@ const FIRST_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 // make the encoder's references diverge from our decoder under heavy motion and
 // the picture never recovers.
 const VIDEO_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
+// The device often ignores a lone PLI/FIR, and without a retry the picture stays
+// frozen until its own periodic keyframe (up to a minute). Re-ask until one lands.
+const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const INPUT_TIMEOUT: Duration = Duration::from_secs(12);
 const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const MEDIA_STOP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -728,7 +731,7 @@ async fn run_control_stream(
                             ).await {
                                 Ok(outcome) => {
                                     has_emitted_video_access_unit |= outcome.emitted_access_unit;
-                                    for feedback_datagram in feedback.consume(&outcome) {
+                                    for feedback_datagram in feedback.consume(&outcome, std::time::Instant::now()) {
                                         if video_udp
                                             .send_to(video_peer_port, feedback_datagram)
                                             .await
@@ -752,9 +755,10 @@ async fn run_control_stream(
                     }
                 }
                 _ = feedback_timer.tick() => {
-                    if let Some(report) = feedback.periodic_report() {
-                        if video_udp.send_to(video_peer_port, report).await.is_err() {
-                            break Err(video_control_delivery_failed());
+                    let retry = feedback.keyframe_retry(std::time::Instant::now());
+                    for datagram in feedback.periodic_report().into_iter().chain(retry) {
+                        if video_udp.send_to(video_peer_port, datagram).await.is_err() {
+                            break 'stream Err(video_control_delivery_failed());
                         }
                     }
                 }
@@ -1301,6 +1305,7 @@ struct LiveVideoState {
 struct VideoDatagramOutcome {
     completed_frame_timestamps: Vec<u32>,
     emitted_access_unit: bool,
+    emitted_sync_access_unit: bool,
     highest_sequence_number: Option<u16>,
     requires_keyframe: bool,
 }
@@ -1320,6 +1325,8 @@ struct VideoFeedbackState {
     received_packets: u32,
     // (expected, received) at the previous report, for the interval's fraction lost.
     previous_report: (u32, u32),
+    // When the last keyframe request went out, while no sync frame has arrived since.
+    pending_keyframe_request: Option<std::time::Instant>,
 }
 
 impl VideoFeedbackState {
@@ -1333,10 +1340,11 @@ impl VideoFeedbackState {
             our_ssrc,
             received_packets: 0,
             previous_report: (0, 0),
+            pending_keyframe_request: None,
         }
     }
 
-    fn consume(&mut self, outcome: &VideoDatagramOutcome) -> Vec<Vec<u8>> {
+    fn consume(&mut self, outcome: &VideoDatagramOutcome, now: std::time::Instant) -> Vec<Vec<u8>> {
         if let Some(sequence_number) = outcome.highest_sequence_number {
             self.observe_sequence_number(sequence_number);
         }
@@ -1344,18 +1352,33 @@ impl VideoFeedbackState {
         let mut datagrams = Vec::with_capacity(
             outcome.completed_frame_timestamps.len() + usize::from(outcome.requires_keyframe),
         );
+        if outcome.emitted_sync_access_unit {
+            self.pending_keyframe_request = None;
+        }
         if outcome.requires_keyframe {
-            input_trace("video", "keyframe_request");
-            datagrams.push(build_keyframe_request(
-                self.our_ssrc,
-                &self.cname,
-                self.media_ssrc,
-                &[],
-                self.fir_sequence_number,
-            ));
-            self.fir_sequence_number = self.fir_sequence_number.wrapping_add(1);
+            datagrams.push(self.keyframe_request(now));
         }
         datagrams
+    }
+
+    /// Re-sends the keyframe request while the decoder is still waiting for one.
+    fn keyframe_retry(&mut self, now: std::time::Instant) -> Option<Vec<u8>> {
+        let sent_at = self.pending_keyframe_request?;
+        (now.duration_since(sent_at) >= KEYFRAME_RETRY_INTERVAL).then(|| self.keyframe_request(now))
+    }
+
+    fn keyframe_request(&mut self, now: std::time::Instant) -> Vec<u8> {
+        input_trace("video", "keyframe_request");
+        self.pending_keyframe_request = Some(now);
+        let request = build_keyframe_request(
+            self.our_ssrc,
+            &self.cname,
+            self.media_ssrc,
+            &[],
+            self.fir_sequence_number,
+        );
+        self.fir_sequence_number = self.fir_sequence_number.wrapping_add(1);
+        request
     }
 
     /// RR with real loss figures: the encoder lowers its bitrate when it sees
@@ -1534,6 +1557,7 @@ fn emit_prepared_video_datagram(
         match event {
             HevcDepacketizerEvent::AccessUnit(access_unit) => {
                 let rtp_timestamp = access_unit.rtp_timestamp;
+                outcome.emitted_sync_access_unit |= access_unit.is_sync;
                 if access_unit.parameter_set_revision > *last_configuration_revision {
                     let orientation =
                         authoritative_orientation.ok_or_else(orientation_state_failed)?;
@@ -3499,9 +3523,11 @@ mod tests {
             emitted_access_unit: true,
             highest_sequence_number: Some(u16::MAX - 1),
             requires_keyframe: false,
+            ..Default::default()
         };
+        let start = std::time::Instant::now();
         assert!(
-            feedback.consume(&first).is_empty(),
+            feedback.consume(&first, start).is_empty(),
             "no per-frame ACK: it desyncs the encoder under motion"
         );
         let report = |highest_seq, fraction_lost, cumulative_lost| {
@@ -3530,7 +3556,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            feedback.consume(&wrapped),
+            feedback.consume(&wrapped, start),
             vec![build_keyframe_request(
                 our_ssrc,
                 call_id,
@@ -3543,6 +3569,24 @@ mod tests {
             feedback.periodic_report(),
             report(0x1_0000, 128, 1),
             "the wraparound is extended and the skipped packet is reported lost"
+        );
+
+        assert_eq!(feedback.keyframe_retry(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            feedback.keyframe_retry(start + KEYFRAME_RETRY_INTERVAL),
+            Some(build_keyframe_request(our_ssrc, call_id, device_ssrc, &[], 1)),
+            "an ignored keyframe request is repeated"
+        );
+        let synced = VideoDatagramOutcome {
+            emitted_access_unit: true,
+            emitted_sync_access_unit: true,
+            ..Default::default()
+        };
+        feedback.consume(&synced, start + KEYFRAME_RETRY_INTERVAL);
+        assert_eq!(
+            feedback.keyframe_retry(start + Duration::from_secs(60)),
+            None,
+            "a sync frame ends the retries"
         );
     }
 
