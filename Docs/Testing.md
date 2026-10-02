@@ -21,13 +21,11 @@ fast repository checks; product changes run the complete Swift and Rust test,
 source-check, generated-project, app-build, and visual validation suite. Set
 `DEVICE_HUB_FULL_CI=1` to force every gate locally.
 
-GitHub Actions uses one Xcode 27 runner and one checkout. Every repository
-command is a named `mise` task. SwiftFormat, SwiftLint, ShellCheck, jscpd,
-Periphery, Rust tests, Swift package tests, protocol verification, and the
-unsigned Release build run as individually visible background steps with
-separate logs. Simulator-bound media verification remains serialized. Pull
-requests targeting `main` use the same workflow, while workflows from external
-forks require maintainer approval before they run.
+There is no hosted CI: `mise run ci` on a Mac with Xcode 27 is the signoff
+gate. Every repository command is a named `mise` task. Documentation-only
+scope is decided against the merge-base with the default branch, so unpushed
+commits and deletions always run the full suite, and the run fails if any
+gate changes the checkout.
 
 ## Simulator ownership
 
@@ -49,8 +47,8 @@ codex-simulator-lease status --json
 
 The reaper targets only the registered UUID and retains durable state when
 cleanup cannot be verified. Isolated environments without the shared
-supervisor, including GitHub-hosted runners, use one stable managed simulator
-name and verified exact-device teardown.
+supervisor use one stable managed simulator name and verified exact-device
+teardown.
 
 ## Regression strategy
 
