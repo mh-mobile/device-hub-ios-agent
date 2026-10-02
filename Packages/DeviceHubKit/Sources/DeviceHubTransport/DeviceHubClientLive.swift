@@ -285,7 +285,6 @@ struct RemotePairingBonjourClient: Sendable {
             String
         ) async -> AsyncThrowingStream<PairingAdvertisementEvent, Error>
     var releaseDevice: @Sendable (DeviceID) async -> Void
-    var stopAvailability: @Sendable () async -> Void
     var stopPairingAdvertisement: @Sendable () async -> Void
     var refreshKnownDevices:
         @Sendable () async throws(RemotePairingBonjourError) -> Void
@@ -311,9 +310,6 @@ private extension RemotePairingBonjourTransport {
             },
             releaseDevice: { deviceID in
                 await self.releaseDevice(deviceID)
-            },
-            stopAvailability: {
-                await self.stopAvailability()
             },
             stopPairingAdvertisement: {
                 await self.stopPairingAdvertisement()
@@ -371,11 +367,11 @@ private actor DeviceHubTransportRuntime {
         let task = Task {
             await self.runAvailability(continuation: stream.continuation)
         }
+        // Cancelling the task ends its iteration of the transport stream,
+        // which stops exactly that browse generation by its own token. An
+        // untokened stop here could end a newer generation already running.
         stream.continuation.onTermination = { _ in
             task.cancel()
-            Task {
-                await self.environment.bonjour.stopAvailability()
-            }
         }
         return stream.stream
     }

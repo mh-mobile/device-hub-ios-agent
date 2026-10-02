@@ -29,6 +29,7 @@ extension RemoteSessionFeature {
                 return .none
             }
             session.connectionError = .connectionLost
+            session.sessionID = nil
             state.activeContactIDs.removeAll()
             state.remediation = DeviceHubRemediation(
                 error: .connectionLost
@@ -50,6 +51,7 @@ extension RemoteSessionFeature {
                 "session_stream_failed error=\(String(describing: error))"
             )
             session.connectionError = error
+            session.sessionID = nil
             state.activeContactIDs.removeAll()
             state.remediation = DeviceHubRemediation(error: error)
             state.session = session
@@ -161,6 +163,7 @@ extension RemoteSessionFeature {
         state.session = session
 
         if update.event.endsSession {
+            state.session?.sessionID = nil
             state.activeContactIDs.removeAll()
             return .concatenate(
                 closeSessionEffect(session: session),

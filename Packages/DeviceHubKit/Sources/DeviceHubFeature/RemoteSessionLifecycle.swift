@@ -32,8 +32,19 @@ extension RemoteSessionFeature {
                 guard let previousSession else {
                     return cancelAllEffects()
                 }
+                // Releasing input and stopping media must reach the device
+                // before iOS suspends the process.
+                let sessionCoordinator = sessionCoordinator
                 return .concatenate(
-                    closeSessionEffect(session: previousSession),
+                    .run { [backgroundExecution] _ in
+                        await backgroundExecution.protect(
+                            "close-remote-session"
+                        ) {
+                            _ = await sessionCoordinator.close(
+                                attemptID: previousSession.attemptID
+                            )
+                        }
+                    },
                     cancelAllEffects()
                 )
 

@@ -15,6 +15,7 @@ public struct RemoteSessionFeature {
         case rosterLoad
     }
 
+    @Dependency(\.backgroundExecution) var backgroundExecution
     @Dependency(\.date) var date
     @Dependency(\.deviceHub) var deviceHub
     @Dependency(\.uuid) var uuid

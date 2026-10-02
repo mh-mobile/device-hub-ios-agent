@@ -17,6 +17,9 @@ actor DeviceSessionCoordinator {
 
     private var activeSession: OwnedSession?
     private var latestAttemptID: UUID?
+    /// The most recent close, which `replace` awaits so a new connection
+    /// never overlaps the previous session's input release and disconnect.
+    private var teardown: Task<Void, Never>?
 
     func command(
         _ command: DeviceCommand,
@@ -74,15 +77,22 @@ actor DeviceSessionCoordinator {
         }
 
         self.activeSession = nil
-        let cleanupError: DeviceHubError?
-        do {
-            try await activeSession.session.command(.releaseAllInput)
-            cleanupError = nil
-        } catch {
-            cleanupError = mapCleanupError(error)
+        let session = activeSession.session
+        let previousTeardown = teardown
+        let closing = Task { () -> DeviceHubError? in
+            await previousTeardown?.value
+            let cleanupError: DeviceHubError?
+            do {
+                try await session.command(.releaseAllInput)
+                cleanupError = nil
+            } catch {
+                cleanupError = mapCleanupError(error)
+            }
+            await session.disconnect()
+            return cleanupError
         }
-        await activeSession.session.disconnect()
-        return cleanupError
+        teardown = Task { _ = await closing.value }
+        return await closing.value
     }
 
     func replace(
@@ -93,6 +103,10 @@ actor DeviceSessionCoordinator {
         try Task.checkCancellation()
         latestAttemptID = attemptID
 
+        await teardown?.value
+        guard !Task.isCancelled, latestAttemptID == attemptID else {
+            throw CancellationError()
+        }
         let session = try await client.connect(deviceID)
         guard !Task.isCancelled,
               latestAttemptID == attemptID

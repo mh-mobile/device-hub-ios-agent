@@ -275,15 +275,6 @@ struct RemoteSessionFeatureTests {
             device: device,
             receivedAt: time
         )
-        let store = TestStore(
-            initialState: RemoteSessionFeature.State(
-                roster: DeviceRoster(devices: [device]),
-                selectedDeviceID: device.id,
-                session: current
-            )
-        ) {
-            RemoteSessionFeature()
-        }
         let sessionID = try #require(current.sessionID)
         let errors: [DeviceHubError] = [
             .localNetworkDenied,
@@ -297,6 +288,15 @@ struct RemoteSessionFeatureTests {
         ]
 
         for error in errors {
+            let store = TestStore(
+                initialState: RemoteSessionFeature.State(
+                    roster: DeviceRoster(devices: [device]),
+                    selectedDeviceID: device.id,
+                    session: current
+                )
+            ) {
+                RemoteSessionFeature()
+            }
             await store.send(
                 .sessionStreamFailed(
                     attemptID: current.attemptID,
@@ -306,8 +306,56 @@ struct RemoteSessionFeatureTests {
             ) {
                 $0.remediation = DeviceHubRemediation(error: error)
                 $0.session?.connectionError = error
+                $0.session?.sessionID = nil
             }
         }
+    }
+
+    @Test("A frame that arrives after the session failed cannot clear the failure")
+    func lateFrameAfterFailureIsIgnored() async throws {
+        let time = Date(timeIntervalSince1970: 5100)
+        let device = device(id: "device", name: "Test iPhone")
+        let current = try connectedSession(
+            device: device,
+            receivedAt: time
+        )
+        let sessionID = try #require(current.sessionID)
+        let generation = try #require(current.remoteState?.generation)
+        let store = TestStore(
+            initialState: RemoteSessionFeature.State(
+                roster: DeviceRoster(devices: [device]),
+                selectedDeviceID: device.id,
+                session: current
+            )
+        ) {
+            RemoteSessionFeature()
+        } withDependencies: {
+            $0.date.now = time
+        }
+
+        await store.send(
+            .sessionStreamFailed(
+                attemptID: current.attemptID,
+                sessionID: sessionID,
+                error: .connectionLost
+            )
+        ) {
+            $0.remediation = DeviceHubRemediation(error: .connectionLost)
+            $0.session?.connectionError = .connectionLost
+            $0.session?.sessionID = nil
+        }
+        try await store.send(
+            .frameReceived(
+                attemptID: current.attemptID,
+                sessionID: sessionID,
+                frame: remoteFrame(
+                    generation: generation,
+                    receivedAt: time,
+                    sequenceNumber: 2
+                )
+            )
+        )
+        #expect(!store.state.acceptsInput)
     }
 
     @Test("Backgrounding clears pixels, pairing codes, and held input")

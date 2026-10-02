@@ -108,6 +108,10 @@ public struct ActiveRemoteSession: Equatable, Sendable {
     /// Pure state machine for the active transport generation.
     public var remoteState: RemoteSessionState?
     /// Identity of the transport session currently owned by the coordinator.
+    ///
+    /// Cleared when the session ends, so late frames, updates, and command
+    /// results from the closed session no longer match and cannot overwrite
+    /// its terminal error or remediation.
     public var sessionID: DeviceSessionID?
     /// Next reducer-assigned position in this attempt's strict command order.
     var nextCommandSequenceNumber: UInt64
