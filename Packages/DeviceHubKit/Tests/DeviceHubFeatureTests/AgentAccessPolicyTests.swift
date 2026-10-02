@@ -1,4 +1,5 @@
 import ComposableArchitecture
+import CoreGraphics
 import DeviceHubClient
 import DeviceHubCore
 @testable import DeviceHubFeature
@@ -193,7 +194,7 @@ struct AgentDragCleanupTests {
         )
 
         await #expect(throws: DeviceHubError.self) {
-            try await bridge.drag(from: (10, 10), to: (50, 50), duration: 0, steps: 4)
+            try await bridge.drag(from: (0, 0), to: (1, 1), duration: 0, steps: 4)
         }
 
         let phases = recorded.value.compactMap { command -> TouchPhase? in
@@ -204,5 +205,80 @@ struct AgentDragCleanupTests {
         }
         #expect(phases.first == .began)
         #expect(phases.last == .cancelled)
+    }
+}
+
+@Suite("Agent coordinates")
+struct AgentCoordinateTests {
+    @Test("a point in a landscape screenshot is sent in native portrait pixels")
+    func landscapePointsAreRotated() async throws {
+        let recorded = LockIsolated<[DeviceCommand]>([])
+        let bridge = try agentBridge(
+            nativePixels: PixelSize(width: 100, height: 200),
+            orientation: .landscapeLeft,
+            imageWidth: 200,
+            imageHeight: 100,
+            recorded: recorded
+        )
+
+        try await bridge.tap(x: 0, y: 0)
+
+        #expect(recorded.value == [.tap(TargetPixelPoint(x: 99, y: 0))])
+    }
+
+    @Test("a point outside the screenshot is rejected, not clamped")
+    func outsidePointsAreRejected() async throws {
+        let recorded = LockIsolated<[DeviceCommand]>([])
+        let bridge = try agentBridge(
+            nativePixels: PixelSize(width: 100, height: 200),
+            orientation: .portrait,
+            imageWidth: 100,
+            imageHeight: 200,
+            recorded: recorded
+        )
+
+        await #expect(throws: AgentBridgeError.self) {
+            try await bridge.tap(x: 150, y: 10)
+        }
+        #expect(recorded.value.isEmpty)
+    }
+
+    private func agentBridge(
+        nativePixels: PixelSize,
+        orientation: ScreenOrientation,
+        imageWidth: Int,
+        imageHeight: Int,
+        recorded: LockIsolated<[DeviceCommand]>
+    ) throws -> AgentBridge {
+        let context = try #require(CGContext(
+            data: nil,
+            width: imageWidth,
+            height: imageHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: imageWidth * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let frame = try RemoteDisplayFrame(
+            metadata: .videoFrame(FrameMetadata(
+                generation: SessionGeneration(rawValue: fixtureUUID(97)),
+                sequenceNumber: 1,
+                receivedAt: Date(timeIntervalSince1970: 0),
+                pixelSize: nativePixels,
+                orientation: orientation
+            )),
+            image: #require(context.makeImage())
+        )
+        let session = DeviceSession(
+            id: DeviceSessionID(rawValue: fixtureUUID(98)),
+            device: device(id: "agent", name: "Test iPhone"),
+            events: AsyncThrowingStream { $0.finish() },
+            frames: AsyncStream { $0.finish() },
+            command: { command in recorded.withValue { $0.append(command) } },
+            disconnect: {}
+        )
+        let bridge = AgentBridge()
+        bridge.update(session: session, frame: frame)
+        return bridge
     }
 }
