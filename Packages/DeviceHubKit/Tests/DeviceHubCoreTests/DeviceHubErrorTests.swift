@@ -95,7 +95,7 @@ struct DeviceHubErrorTests {
             .secureConnectionFailed: Expectation(
                 classification: .transient,
                 remedy: .retry,
-                retryability: .automatic
+                retryability: .userInitiated
             ),
             .mediaStalled: Expectation(
                 classification: .transient,
@@ -105,7 +105,7 @@ struct DeviceHubErrorTests {
             .decoderFailed: Expectation(
                 classification: .transient,
                 remedy: .retry,
-                retryability: .automatic
+                retryability: .userInitiated
             )
         ]
 

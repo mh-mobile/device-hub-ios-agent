@@ -41,6 +41,7 @@ extension RemoteSessionFeature {
                 // before iOS suspends the process.
                 let sessionCoordinator = sessionCoordinator
                 return .concatenate(
+                    cancelAllEffects(),
                     .run { [backgroundExecution] _ in
                         await backgroundExecution.protect(
                             "close-remote-session"
@@ -49,8 +50,7 @@ extension RemoteSessionFeature {
                                 attemptID: previousSession.attemptID
                             )
                         }
-                    },
-                    cancelAllEffects()
+                    }
                 )
 
             case .inactive:
@@ -70,9 +70,20 @@ extension RemoteSessionFeature {
             }
             return .run { [clock] send in
                 try await clock.sleep(for: Self.recoveryDelay)
-                await send(.task)
+                await send(.availabilityRestartDue)
             }
             .cancellable(id: CancelID.availabilityRestart, cancelInFlight: true)
+
+        case .availabilityRestartDue:
+            // Only observation restarts: reloading the roster would replace
+            // live devices with unreachable records until the next snapshot.
+            guard state.lifecycle == .active,
+                  !state.isObservingAvailability
+            else {
+                return .none
+            }
+            state.isObservingAvailability = true
+            return observeAvailabilityEffect()
 
         case .task:
             guard state.lifecycle == .active else {

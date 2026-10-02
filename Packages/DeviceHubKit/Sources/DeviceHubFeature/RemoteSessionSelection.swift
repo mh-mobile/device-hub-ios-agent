@@ -47,6 +47,19 @@ extension RemoteSessionFeature {
             }
 
         case let .reconnectTimerFired(attemptID):
+            guard state.lifecycle != .inactive else {
+                // A notification or Slide Over made the app briefly
+                // inactive; try again later instead of dropping the retry.
+                guard let session = state.session,
+                      session.attemptID == attemptID
+                else {
+                    return .none
+                }
+                return reconnectEffect(
+                    attemptID: attemptID,
+                    after: session.connectionError
+                )
+            }
             guard state.lifecycle == .active,
                   !state.isViewingStopped,
                   let session = state.session,
@@ -94,8 +107,8 @@ extension RemoteSessionFeature {
                 return cancelSessionEffects()
             }
             return .concatenate(
-                closeSessionEffect(session: previousSession),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                closeSessionEffect(session: previousSession)
             )
 
         default:
@@ -121,8 +134,8 @@ extension RemoteSessionFeature {
                 return cancelSessionEffects()
             }
             return .concatenate(
-                closeSessionEffect(session: previousSession),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                closeSessionEffect(session: previousSession)
             )
         }
 
@@ -144,8 +157,8 @@ extension RemoteSessionFeature {
             )
         }
         return .concatenate(
-            closeSessionEffect(session: previousSession),
             cancelSessionEffects(),
+            closeSessionEffect(session: previousSession),
             connect
         )
     }
@@ -177,8 +190,8 @@ extension RemoteSessionFeature {
                     return cancelSessionEffects()
                 }
                 return .concatenate(
-                    closeSessionEffect(session: previousSession),
-                    cancelSessionEffects()
+                    cancelSessionEffects(),
+                    closeSessionEffect(session: previousSession)
                 )
             }
             return deviceUpdate
@@ -221,8 +234,8 @@ extension RemoteSessionFeature {
             state.remediation = DeviceHubRemediation(error: .needsPairing)
             state.activeContactIDs.removeAll()
             return .concatenate(
-                closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                closeSessionEffect(session: session)
             )
         }
         guard wasAcceptingInput, !session.acceptsInput else {

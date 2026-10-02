@@ -36,8 +36,8 @@ extension RemoteSessionFeature {
             )
             state.session = session
             return .concatenate(
-                closeSessionEffect(session: session),
                 cancelSessionEffects(),
+                closeSessionEffect(session: session),
                 reconnectEffect(attemptID: attemptID, after: .connectionLost)
             )
 
@@ -57,8 +57,8 @@ extension RemoteSessionFeature {
             state.remediation = DeviceHubRemediation(error: error)
             state.session = session
             return .concatenate(
-                closeSessionEffect(session: session),
                 cancelSessionEffects(),
+                closeSessionEffect(session: session),
                 reconnectEffect(attemptID: attemptID, after: error)
             )
 
@@ -168,8 +168,8 @@ extension RemoteSessionFeature {
             state.session?.sessionID = nil
             state.activeContactIDs.removeAll()
             return .concatenate(
-                closeSessionEffect(session: session),
                 cancelSessionEffects(),
+                closeSessionEffect(session: session),
                 reconnectEffect(
                     attemptID: session.attemptID,
                     after: session.connectionError

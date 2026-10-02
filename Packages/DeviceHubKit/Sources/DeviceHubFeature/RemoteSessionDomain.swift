@@ -121,6 +121,7 @@ public extension RemoteSessionFeature {
     enum Action {
         case appLifecycleChanged(DeviceHubAppLifecycle)
         case availabilityObservationFinished
+        case availabilityRestartDue
         case availabilitySnapshotReceived([DeviceSummary])
         case buttonTapped(DeviceButton)
         case commandFailed(
