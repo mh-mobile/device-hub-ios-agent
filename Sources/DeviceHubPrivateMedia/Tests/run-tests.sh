@@ -5,14 +5,16 @@ set -euo pipefail
 tests_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 module_dir=$(cd "$tests_dir/.." && pwd)
 repository_root=$(cd "$tests_dir/../../.." && pwd)
+ROOT="$repository_root"
+# shellcheck source=BuildSupport/simulator_guard.sh
+source "$repository_root/BuildSupport/simulator_guard.sh"
+devicehub_enter_simulator_lease device-hub-private-media-tests 900 "$0" "$@"
+
 process_guard="$repository_root/BuildSupport/process_guard.sh"
 # shellcheck source=BuildSupport/process_guard.sh
 source "$process_guard"
 devicehub_require_guard private-media-tests 900 "$0" "$@"
 
-ROOT="$repository_root"
-# shellcheck source=BuildSupport/simulator_guard.sh
-source "$repository_root/BuildSupport/simulator_guard.sh"
 devicehub_require_simulator device-hub-private-media-tests 900 "$0" "$@"
 
 temp_root=${TMPDIR:-/tmp}
@@ -35,7 +37,7 @@ cleanup() {
   if ! devicehub_cleanup_simulator; then
     status=125
   fi
-  return "$status"
+  exit "$status"
 }
 trap cleanup EXIT
 

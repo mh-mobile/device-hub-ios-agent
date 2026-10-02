@@ -28,6 +28,20 @@ HEAVY_ENTRYPOINTS = (
 
 
 class ProcessGuardEntrypointTests(unittest.TestCase):
+    def test_exit_trap_cleanup_failures_change_the_exit_status(self) -> None:
+        # `return` from an EXIT trap leaves the shell's exit status unchanged,
+        # so a failed cleanup would still report success.
+        for path in (
+            ROOT / "ci" / "run_ci.sh",
+            ROOT / "Scripts" / "test-app.sh",
+            ROOT / "Sources" / "DeviceHubPrivateMedia" / "Tests" / "run-tests.sh",
+        ):
+            with self.subTest(path=path.relative_to(ROOT)):
+                contents = path.read_text()
+                self.assertIn("trap cleanup EXIT", contents)
+                self.assertIn('  exit "$status"\n}', contents)
+                self.assertNotIn('return "$status"', contents)
+
     def test_shell_entrypoint_acquires_guard_and_marks_child(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_root = Path(temporary_directory)

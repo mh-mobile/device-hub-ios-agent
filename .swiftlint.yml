@@ -2,6 +2,7 @@ included:
   - Packages/DeviceHubKit/Sources
   - Packages/DeviceHubKit/Tests
   - Sources
+  - Tests
   - Tools/DeviceHubPreviewRenderer/Sources
   - Tools/DeviceHubPreviewRenderer/Tests
 

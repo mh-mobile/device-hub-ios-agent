@@ -3,6 +3,33 @@
 # Route local agent work through the host-wide simulator supervisor. Isolated
 # environments without that supervisor use one stable, exact simulator name
 # and verified teardown instead of accumulating per-process devices.
+
+# Re-executes the script under the host-wide simulator supervisor when it is
+# available and not yet held. Call this before devicehub_require_guard: the
+# supervisor cannot preserve the guard's private file descriptor, so a guard
+# taken first would contend with its own re-executed child.
+devicehub_enter_simulator_lease() {
+  local lease_name="${1:?lease name required}"
+  local timeout_seconds="${2:?timeout required}"
+  local script_path="${3:?script path required}"
+  shift 3
+
+  if [[ -n "${DEVICE_HUB_SIMULATOR_UDID:-}" || -n "${CODEX_SIMULATOR_LEASE_ID:-}" ]]; then
+    return 0
+  fi
+  if command -v codex-simulator-lease >/dev/null 2>&1; then
+    unset DEVICE_HUB_SIMULATOR_UDID
+    exec "$(command -v codex-simulator-lease)" run \
+      --name "$lease_name" \
+      --timeout-seconds "$timeout_seconds" \
+      -- "$script_path" "$@"
+  fi
+  if [[ "${CODEX_AGENT:-0}" == "1" ]]; then
+    printf 'codex-simulator-lease is required for agent-driven simulator work.\n' >&2
+    return 125
+  fi
+}
+
 devicehub_require_simulator() {
   local lease_name="${1:?lease name required}"
   local timeout_seconds="${2:?timeout required}"
@@ -27,23 +54,8 @@ devicehub_require_simulator() {
     esac
   fi
 
-  local shared_supervisor=""
-  if [[ -n "${CODEX_SIMULATOR_LEASE_ID:-}" ]]; then
-    shared_supervisor="${CODEX_SIMULATOR_LEASE_COMMAND:?lease command missing}"
-  elif command -v codex-simulator-lease >/dev/null 2>&1; then
-    shared_supervisor="$(command -v codex-simulator-lease)"
-  elif [[ "${CODEX_AGENT:-0}" == "1" ]]; then
-    printf 'codex-simulator-lease is required for agent-driven simulator work.\n' >&2
-    return 125
-  fi
-
-  if [[ -n "$shared_supervisor" && -z "${CODEX_SIMULATOR_LEASE_ID:-}" ]]; then
-    unset DEVICE_HUB_SIMULATOR_UDID
-    exec "$shared_supervisor" run \
-      --name "$lease_name" \
-      --timeout-seconds "$timeout_seconds" \
-      -- "$script_path" "$@"
-  fi
+  devicehub_enter_simulator_lease \
+    "$lease_name" "$timeout_seconds" "$script_path" "$@" || return
 
   local setup_mode="direct"
   if [[ -n "${CODEX_SIMULATOR_LEASE_ID:-}" ]]; then

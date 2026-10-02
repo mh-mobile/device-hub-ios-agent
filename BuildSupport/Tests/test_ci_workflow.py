@@ -42,7 +42,9 @@ class CILocalGateContractTests(unittest.TestCase):
     def test_ci_acquires_one_simulator_lease_before_the_process_guard(self) -> None:
         source = CI_PATH.read_text()
 
-        simulator_index = source.index("--name device-hub-full-ci")
+        simulator_index = source.index(
+            "devicehub_enter_simulator_lease device-hub-full-ci"
+        )
         process_index = source.index("devicehub_require_guard full-ci")
         self.assertLess(simulator_index, process_index)
         self.assertIn("devicehub_require_simulator device-hub-full-ci", source)
@@ -51,8 +53,13 @@ class CILocalGateContractTests(unittest.TestCase):
     def test_ci_fails_when_verification_changes_the_checkout(self) -> None:
         source = CI_PATH.read_text()
 
-        self.assertIn("git diff", source)
-        self.assertIn("Device Hub CI passed", source)
+        snapshot = source.index('CHECKOUT_BEFORE="$(checkout_state)"')
+        first_gate = source.index("run_ci_task test")
+        comparison = source.index('"$(checkout_state)" != "$CHECKOUT_BEFORE"')
+        passed = source.index("Device Hub CI passed")
+        self.assertLess(snapshot, first_gate)
+        self.assertLess(first_gate, comparison)
+        self.assertLess(comparison, passed)
 
 
 if __name__ == "__main__":

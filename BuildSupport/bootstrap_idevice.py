@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import os
 import shutil
@@ -112,6 +113,7 @@ def bootstrap(
     lock_path = vendor_directory / ".idevice-bootstrap.lock"
 
     with _exclusive_lock(lock_path):
+        _remove_stale_staging(vendor_directory)
         _verify_patch(specification)
 
         if destination.exists():
@@ -271,21 +273,29 @@ def _run_git(
 
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
-    try:
-        descriptor = os.open(
-            path,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-        )
-    except FileExistsError as error:
-        raise BootstrapError("another idevice bootstrap is already running") from error
+    """Hold an advisory lock that the kernel releases if this process dies.
 
+    The lock file itself is left in place, so a bootstrap killed by a signal
+    never blocks the next one.
+    """
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
     try:
-        os.write(descriptor, f"{os.getpid()}\n".encode())
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise BootstrapError(
+                "another idevice bootstrap is already running"
+            ) from error
         yield
     finally:
         os.close(descriptor)
-        path.unlink(missing_ok=True)
+
+
+def _remove_stale_staging(vendor_directory: Path) -> None:
+    """Remove staging trees left by a bootstrap that died holding the lock."""
+    for path in vendor_directory.glob(".idevice-bootstrap-*"):
+        if path.is_dir():
+            _remove_generated_tree(path, vendor_directory)
 
 
 def _remove_generated_tree(path: Path, allowed_parent: Path) -> None:

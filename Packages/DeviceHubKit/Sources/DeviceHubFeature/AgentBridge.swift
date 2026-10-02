@@ -25,7 +25,9 @@ public final class AgentBridge: @unchecked Sendable {
 
     public enum Failure: Error, CustomStringConvertible {
         case noSession
-        public var description: String { "no device is being shown; open one in Device Hub first" }
+        public var description: String {
+            "no device is being shown; open one in Device Hub first"
+        }
     }
 
     /// Target pixel size of the latest frame: the coordinate space for every command.
@@ -54,7 +56,7 @@ public final class AgentBridge: @unchecked Sendable {
             TargetPixelPoint(x: start.0 + (end.0 - start.0) * t, y: start.1 + (end.1 - start.1) * t)
         }
         try await send(.touch(TouchCommand(contactID: 0, point: point(0), phase: .began)))
-        for step in 1...max(steps, 1) {
+        for step in 1 ... max(steps, 1) {
             try await Task.sleep(for: .seconds(duration / Double(max(steps, 1))))
             try await send(.touch(TouchCommand(contactID: 0, point: point(Double(step) / Double(max(steps, 1))), phase: .moved)))
         }
@@ -95,5 +97,7 @@ public final class AgentBridge: @unchecked Sendable {
 
 public struct AgentBridgeError: Error, CustomStringConvertible {
     public let description: String
-    public init(_ description: String) { self.description = description }
+    public init(_ description: String) {
+        self.description = description
+    }
 }

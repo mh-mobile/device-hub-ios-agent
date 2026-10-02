@@ -34,13 +34,15 @@ public final class AgentHTTPServer: @unchecked Sendable {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
             guard let self else { return }
             var buffer = buffer
-            if let data { buffer.append(data) }
+            if let data {
+                buffer.append(data)
+            }
             if let request = Request(buffer) {
                 Task { await self.respond(to: request, on: connection) }
             } else if done || error != nil || buffer.count > 1_000_000 {
                 connection.cancel()
             } else {
-                self.receive(connection, buffer: buffer)
+                receive(connection, buffer: buffer)
             }
         }
     }
@@ -48,14 +50,16 @@ public final class AgentHTTPServer: @unchecked Sendable {
     private func respond(to request: Request, on connection: NWConnection) async {
         let bridge = AgentBridge.shared
         let body = request.json
-        func number(_ key: String) -> Double? { (body[key] as? NSNumber)?.doubleValue }
+        func number(_ key: String) -> Double? {
+            (body[key] as? NSNumber)?.doubleValue
+        }
         do {
             switch (request.method, request.path) {
             case ("GET", "/screen"):
                 let size = try bridge.screenSize()
                 send(connection, json: ["width": size.width, "height": size.height])
             case ("GET", "/screenshot"):
-                send(connection, status: "200 OK", type: "image/png", body: try bridge.screenshotPNG())
+                try send(connection, status: "200 OK", type: "image/png", body: bridge.screenshotPNG())
             case ("POST", "/tap"):
                 guard let x = number("x"), let y = number("y") else { throw AgentBridgeError("tap needs x and y") }
                 try await bridge.tap(x: x, y: y)

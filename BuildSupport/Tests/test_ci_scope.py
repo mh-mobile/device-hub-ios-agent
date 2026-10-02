@@ -41,6 +41,59 @@ class CIScopeTests(unittest.TestCase):
                 {"README.md", "Docs/Design.md"},
             )
 
+    def test_unpushed_branch_includes_commits_since_the_default_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = self.make_pushed_repository(Path(directory))
+            self.run_git(repository, "switch", "-c", "feature")
+            (repository / "App.swift").write_text("let changed = 1\n")
+            self.run_git(repository, "commit", "-am", "Change source")
+            (repository / "Notes.md").write_text("Untracked\n")
+
+            self.assertIn("App.swift", changed_paths(repository))
+            self.assertFalse(is_documentation_only(changed_paths(repository)))
+
+    def test_deleted_source_is_not_documentation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = self.make_pushed_repository(Path(directory))
+            self.run_git(repository, "rm", "-q", "App.swift")
+            (repository / "README.md").write_text("Edited\n")
+
+            self.assertIn("App.swift", changed_paths(repository))
+            self.assertFalse(is_documentation_only(changed_paths(repository)))
+
+    def test_unknown_base_is_never_documentation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.run_git(repository, "init", "-b", "feature")
+            self.configure(repository)
+            (repository / "App.swift").write_text("let value = 0\n")
+            self.run_git(repository, "add", "App.swift")
+            self.run_git(repository, "commit", "-m", "Initial")
+            (repository / "README.md").write_text("Docs\n")
+
+            self.assertIsNone(changed_paths(repository))
+            self.assertFalse(is_documentation_only(changed_paths(repository)))
+
+    def make_pushed_repository(self, root: Path) -> Path:
+        repository = root / "work"
+        repository.mkdir()
+        self.run_git(repository, "init", "-b", "main")
+        self.configure(repository)
+        (repository / "README.md").write_text("Initial\n")
+        (repository / "App.swift").write_text("let value = 0\n")
+        self.run_git(repository, "add", ".")
+        self.run_git(repository, "commit", "-m", "Initial")
+        remote = root / "remote.git"
+        self.run_git(repository, "init", "--bare", str(remote))
+        self.run_git(repository, "remote", "add", "origin", str(remote))
+        self.run_git(repository, "push", "-u", "origin", "main")
+        return repository
+
+    def configure(self, repository: Path) -> None:
+        self.run_git(repository, "config", "user.email", "ci@example.com")
+        self.run_git(repository, "config", "user.name", "CI Test")
+        self.run_git(repository, "config", "commit.gpgsign", "false")
+
     @staticmethod
     def run_git(repository: Path, *arguments: str) -> None:
         subprocess.run(

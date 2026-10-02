@@ -18,5 +18,6 @@ PreviewArtifacts/*
 VisualReview/current/*
 !VisualReview/current/.gitkeep
 Vendor/idevice/
+Vendor/.idevice-*
 build/
 xcuserdata/
