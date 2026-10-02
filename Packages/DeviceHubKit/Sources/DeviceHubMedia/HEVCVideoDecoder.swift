@@ -149,9 +149,11 @@ public actor HEVCVideoDecoder {
                 status: status
             )
         }
+        // A dropped frame is skipped, not fatal: the stream recovers at the
+        // next sync sample, which the protocol requests after any loss.
         guard !infoFlags.contains(.frameDropped) else {
             DeviceHubMediaTrace.emit("decoder_submit_dropped")
-            throw MediaDecoderError.outputFrameDropped
+            return
         }
     }
 
@@ -472,7 +474,7 @@ final class FrameDeliveryGate: @unchecked Sendable {
             return
         }
         guard !infoFlags.contains(.frameDropped) else {
-            fail(token: token, error: .outputFrameDropped)
+            DeviceHubMediaTrace.emit("decoder_output_dropped")
             return
         }
         guard let imageBuffer else {

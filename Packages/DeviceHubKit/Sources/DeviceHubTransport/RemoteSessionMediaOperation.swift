@@ -117,8 +117,6 @@ func mediaDiagnosticStage(
         .displayStopped
     case .decodedDimensionsMismatch:
         .firstVisual
-    case .outputFrameDropped:
-        .displayStalled
     case .invalidParameterSet:
         .startingDisplay
     case .invalidSample, .staleGeneration:

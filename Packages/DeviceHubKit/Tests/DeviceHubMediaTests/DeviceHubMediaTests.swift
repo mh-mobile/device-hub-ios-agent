@@ -87,6 +87,53 @@ struct HEVCVideoDecoderTests {
         try await decoder.stop()
     }
 
+    @Test(
+        "a frame the decoder drops is skipped and the stream continues",
+        .timeLimit(.minutes(1))
+    )
+    func droppedFrameDoesNotEndTheStream() async throws {
+        let pair = AsyncThrowingStream.makeStream(
+            of: RemoteDisplayFrame.self,
+            throwing: Error.self,
+            bufferingPolicy: .unbounded
+        )
+        let gate = FrameDeliveryGate(continuation: pair.continuation)
+        gate.activate(token: 1)
+        func metadata(_ sequence: UInt64) -> FrameMetadata {
+            FrameMetadata(
+                generation: .fixture(),
+                sequenceNumber: sequence,
+                receivedAt: Date(timeIntervalSince1970: 1),
+                pixelSize: PixelSize(width: 64, height: 64),
+                orientation: .portrait
+            )
+        }
+
+        gate.receive(
+            token: 1,
+            status: noErr,
+            infoFlags: [.frameDropped],
+            imageBuffer: nil,
+            metadata: metadata(1)
+        )
+        try gate.receive(
+            token: 1,
+            status: noErr,
+            infoFlags: [],
+            imageBuffer: makePixelBuffer(width: 64, height: 64),
+            metadata: metadata(2)
+        )
+        gate.finish()
+
+        var frames = pair.stream.makeAsyncIterator()
+        let published = try await frames.next()
+        guard case let .videoFrame(frame) = published?.metadata else {
+            Issue.record("expected the frame after the dropped one")
+            return
+        }
+        #expect(frame.sequenceNumber == 2)
+    }
+
     @Test(.timeLimit(.minutes(1)))
     func replacementCannotRaceAnOldFramePublication() async throws {
         let oldFramePaused = BlockingSynchronizationPoint()
