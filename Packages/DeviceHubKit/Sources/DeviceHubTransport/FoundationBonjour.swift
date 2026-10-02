@@ -114,6 +114,7 @@ private final class FoundationBonjourBrowserDelegateBridge:
         browser.stop()
         for service in services.values {
             service.delegate = nil
+            service.stopMonitoring()
             service.stop()
         }
         services.removeAll()
@@ -143,6 +144,7 @@ private final class FoundationBonjourBrowserDelegateBridge:
         }
         services.removeValue(forKey: ObjectIdentifier(service))
         service.delegate = nil
+        service.stopMonitoring()
         service.stop()
         handler?(.removed(serviceName: service.name))
     }
@@ -161,13 +163,28 @@ private final class FoundationBonjourBrowserDelegateBridge:
     }
 
     func netServiceDidResolveAddress(_ sender: NetService) {
+        publishResolution(of: sender, txtRecord: sender.txtRecordData())
+        // Pairing a new host changes the device's auth tags. Without TXT
+        // updates the cached record keeps failing verification until the
+        // service is removed and found again.
+        sender.startMonitoring()
+    }
+
+    func netService(_ sender: NetService, didUpdateTXTRecord data: Data) {
+        guard sender.addresses?.isEmpty == false else {
+            return
+        }
+        publishResolution(of: sender, txtRecord: data)
+    }
+
+    private func publishResolution(of sender: NetService, txtRecord: Data?) {
         guard
             browser != nil,
             services[ObjectIdentifier(sender)] != nil,
             let hostName = sender.hostName,
             let addresses = sender.addresses,
             !addresses.isEmpty,
-            let txtRecord = sender.txtRecordData()
+            let txtRecord
         else {
             handler?(.resolutionFailed(BonjourNativeFailure(
                 operation: .resolve,
@@ -207,7 +224,22 @@ private final class FoundationBonjourBrowserDelegateBridge:
             operation: .resolve,
             code: Self.errorCode(from: errorDictionary)
         )))
+        // A device that was briefly unreachable is resolved again rather than
+        // left unresolved until Bonjour re-announces it.
+        // The bridge and its services live on the main thread (see the owner).
+        nonisolated(unsafe) weak let bridge = self
+        nonisolated(unsafe) weak let service = sender
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.resolveRetryDelay) {
+            guard let bridge, let service, bridge.browser != nil,
+                  bridge.services[ObjectIdentifier(service)] != nil
+            else {
+                return
+            }
+            service.resolve(withTimeout: 10)
+        }
     }
+
+    private static let resolveRetryDelay: TimeInterval = 5
 
     private static func errorCode(
         from dictionary: [String: NSNumber]
