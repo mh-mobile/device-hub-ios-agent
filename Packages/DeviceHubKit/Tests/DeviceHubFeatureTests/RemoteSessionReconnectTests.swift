@@ -121,4 +121,60 @@ struct RemoteSessionReconnectTests {
 
         #expect(store.state.reconnectAttempts == 2)
     }
+
+    /// Written out rather than derived from `retryability`, so a wrong
+    /// classification fails here instead of being mirrored by the test.
+    @Test(
+        "only transient failures reconnect on their own",
+        .timeLimit(.minutes(1)),
+        arguments: [
+            (DeviceHubError.connectionLost, true),
+            (.deviceOffline, true),
+            (.mediaStalled, true),
+            (.secureConnectionFailed, false),
+            (.decoderFailed, false),
+            (.needsPairing, false),
+            (.deviceLocked, false)
+        ]
+    )
+    func reconnectsOnlyAfterTransientFailures(error: DeviceHubError, reconnects: Bool) async throws {
+        let time = Date(timeIntervalSince1970: 6400)
+        let device = device(id: "device", name: "Test iPhone")
+        let current = try connectedSession(device: device, receivedAt: time)
+        let clock = TestClock()
+        let connects = LockIsolated(0)
+        let store = TestStore(
+            initialState: RemoteSessionFeature.State(
+                roster: DeviceRoster(devices: [device]),
+                selectedDeviceID: device.id,
+                session: current
+            )
+        ) {
+            RemoteSessionFeature()
+        } withDependencies: {
+            $0.continuousClock = clock
+            $0.date.now = time
+            $0.uuid = .incrementing
+            $0.deviceHub.connect = { _ in
+                connects.withValue { $0 += 1 }
+                throw CancellationError()
+            }
+        }
+        store.exhaustivity = .off
+
+        try await store.send(
+            .sessionStreamFailed(
+                attemptID: current.attemptID,
+                sessionID: #require(current.sessionID),
+                error: error
+            )
+        )
+        await clock.advance(by: .seconds(60))
+        if reconnects {
+            await store.receive(\.reconnectTimerFired)
+        }
+        await store.finish()
+
+        #expect(connects.value == (reconnects ? 1 : 0), "\(error)")
+    }
 }
