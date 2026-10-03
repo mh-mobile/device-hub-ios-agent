@@ -525,8 +525,11 @@ def terminate_process_session_members(
 ) -> bool:
     """Boundedly terminate every same-session process, including new groups.
 
-    With a `deadline`, every inspection and wait ends by it; inspecting past
-    it raises OSError so the caller can fall back.
+    With a `deadline`, the blocking steps (each ps run and each wait) are cut
+    off by it, and inspecting past it raises OSError so the caller can fall
+    back. The short synchronous work between them (reading ps output,
+    signalling members) is not checked, so the deadline can be overrun by
+    that much.
     """
 
     def until(seconds: float) -> float:
@@ -580,7 +583,7 @@ def terminate_process_session_members(
 
     if process is not None:
         try:
-            process.wait(timeout=max(grace_seconds, 0.1))
+            process.wait(timeout=max(until(max(grace_seconds, 0.1)) - time.monotonic(), 0.0))
         except subprocess.TimeoutExpired:
             return False
     return not background_processes_requiring_cleanup(
@@ -690,8 +693,9 @@ def terminate_external_process_session(
 ) -> None:
     """Best-effort cleanup of all session members from the parent watchdog.
 
-    Everything ends by `deadline`: member cleanup stops a grace period early
-    so the session-leader fallback still has its time.
+    The blocking steps end by `deadline` (see
+    `terminate_process_session_members`): member cleanup stops a grace
+    period early so the session-leader fallback still has its time.
     """
 
     try:
