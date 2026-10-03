@@ -1342,6 +1342,133 @@ index cfa8ad2873b9146cbb6b9f6c1507daef0d191e54..91757fc50668b8cc9310c760da93d5ec
 +        }
 +    }
 +}
+diff --git a/idevice/src/remote_pairing/opack.rs b/idevice/src/remote_pairing/opack.rs
+index b1955d502b7d21e3148d305a23932b55b86ff1f8..36b7d6b08063a2d9013d86a017aa473858e3b379 100644
+--- a/idevice/src/remote_pairing/opack.rs
++++ b/idevice/src/remote_pairing/opack.rs
+@@ -2,9 +2,14 @@
+ 
+ use plist::Value;
+ 
++/// Containers nested deeper than this are rejected. Real pairing payloads
++/// nest a few levels; the limit keeps a hostile peer from exhausting the
++/// stack before its signature has been checked.
++const MAX_DEPTH: usize = 64;
++
+ pub fn opack_to_plist(bytes: &[u8]) -> Result<Value, String> {
+     let mut offset = 0;
+-    let value = opack_to_plist_inner(bytes, &mut offset)?;
++    let value = opack_to_plist_inner(bytes, &mut offset, 0)?;
+     if offset != bytes.len() {
+         return Err(format!(
+             "unexpected trailing bytes after OPACK payload: {}",
+@@ -141,7 +146,10 @@ fn plist_to_opack_inner(node: &Value, buf: &mut Vec<u8>) {
+     }
+ }
+ 
+-fn opack_to_plist_inner(bytes: &[u8], offset: &mut usize) -> Result<Value, String> {
++fn opack_to_plist_inner(bytes: &[u8], offset: &mut usize, depth: usize) -> Result<Value, String> {
++    if depth > MAX_DEPTH {
++        return Err("OPACK nesting is too deep".into());
++    }
+     let tag = read_u8(bytes, offset)?;
+     match tag {
+         0x01 => Ok(Value::Boolean(true)),
+@@ -164,10 +172,10 @@ fn opack_to_plist_inner(bytes: &[u8], offset: &mut usize) -> Result<Value, Strin
+         }
+         0x40..=0x64 => parse_string_value(tag, bytes, offset),
+         0x70..=0x94 => parse_data_value(tag, bytes, offset),
+-        0xD0..=0xDE => parse_array(bytes, offset, Some((tag - 0xD0) as usize)),
+-        0xDF => parse_array(bytes, offset, None),
+-        0xE0..=0xEE => parse_dictionary(bytes, offset, Some((tag - 0xE0) as usize)),
+-        0xEF => parse_dictionary(bytes, offset, None),
++        0xD0..=0xDE => parse_array(bytes, offset, Some((tag - 0xD0) as usize), depth + 1),
++        0xDF => parse_array(bytes, offset, None, depth + 1),
++        0xE0..=0xEE => parse_dictionary(bytes, offset, Some((tag - 0xE0) as usize), depth + 1),
++        0xEF => parse_dictionary(bytes, offset, None, depth + 1),
+         0x03 => Err("unexpected OPACK terminator".into()),
+         _ => Err(format!("unsupported OPACK tag: 0x{tag:02x}")),
+     }
+@@ -237,18 +245,23 @@ fn read_sized_len(
+     }
+ }
+ 
+-fn parse_array(bytes: &[u8], offset: &mut usize, count: Option<usize>) -> Result<Value, String> {
++fn parse_array(
++    bytes: &[u8],
++    offset: &mut usize,
++    count: Option<usize>,
++    depth: usize,
++) -> Result<Value, String> {
+     let mut items = Vec::with_capacity(count.unwrap_or(0));
+ 
+     match count {
+         Some(count) => {
+             for _ in 0..count {
+-                items.push(opack_to_plist_inner(bytes, offset)?);
++                items.push(opack_to_plist_inner(bytes, offset, depth)?);
+             }
+         }
+         None => {
+             while !peek_is_terminator(bytes, *offset) {
+-                items.push(opack_to_plist_inner(bytes, offset)?);
++                items.push(opack_to_plist_inner(bytes, offset, depth)?);
+             }
+             *offset += 1;
+         }
+@@ -261,21 +274,22 @@ fn parse_dictionary(
+     bytes: &[u8],
+     offset: &mut usize,
+     count: Option<usize>,
++    depth: usize,
+ ) -> Result<Value, String> {
+     let mut dict = plist::Dictionary::new();
+ 
+     match count {
+         Some(count) => {
+             for _ in 0..count {
+-                let key = read_dictionary_key(bytes, offset)?;
+-                let value = opack_to_plist_inner(bytes, offset)?;
++                let key = read_dictionary_key(bytes, offset, depth)?;
++                let value = opack_to_plist_inner(bytes, offset, depth)?;
+                 dict.insert(key, value);
+             }
+         }
+         None => {
+             while !peek_is_terminator(bytes, *offset) {
+-                let key = read_dictionary_key(bytes, offset)?;
+-                let value = opack_to_plist_inner(bytes, offset)?;
++                let key = read_dictionary_key(bytes, offset, depth)?;
++                let value = opack_to_plist_inner(bytes, offset, depth)?;
+                 dict.insert(key, value);
+             }
+             *offset += 1;
+@@ -285,8 +299,8 @@ fn parse_dictionary(
+     Ok(Value::Dictionary(dict))
+ }
+ 
+-fn read_dictionary_key(bytes: &[u8], offset: &mut usize) -> Result<String, String> {
+-    opack_to_plist_inner(bytes, offset)?
++fn read_dictionary_key(bytes: &[u8], offset: &mut usize, depth: usize) -> Result<String, String> {
++    opack_to_plist_inner(bytes, offset, depth)?
+         .into_string()
+         .ok_or_else(|| "dictionary key is not a string".to_string())
+ }
+@@ -331,6 +345,14 @@ fn read_string(bytes: &[u8], offset: &mut usize, len: usize) -> Result<String, S
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn deeply_nested_input_is_an_error_not_a_stack_overflow() {
++        // A peer sends this before M5's signature is checked; 6000 nested
++        // open arrays used to recurse until the process aborted.
++        let nested = vec![0xDF; 6000];
++        assert!(super::opack_to_plist(&nested).is_err());
++    }
++
+     #[test]
+     fn t1() {
+         let v = crate::plist!({
 diff --git a/idevice/src/remote_pairing/peer_device.rs b/idevice/src/remote_pairing/peer_device.rs
 index 266e12e3385c0bbe8fe4b331774437a53d6edc5a..4572e1683c957bd107209c86b78c83986d0d4c1b 100644
 --- a/idevice/src/remote_pairing/peer_device.rs
@@ -11373,6 +11500,162 @@ index 50d3ac561b54aaf7cedbe37023a2e3b84a11a348..8ca26b7304aa0d89acb8913bca1f1ae1
  
          Ok(res)
      }
+diff --git a/idevice/src/xpc/format.rs b/idevice/src/xpc/format.rs
+index ec47cdeefe2239f2342489c11c04836003a2f9f9..ff44ceacf151b499e57872fda7fc31ea6033a23c 100644
+--- a/idevice/src/xpc/format.rs
++++ b/idevice/src/xpc/format.rs
+@@ -288,10 +288,26 @@ impl XPCObject {
+             return Err(XpcError::UnexpectedXpcVersion.into());
+         }
+ 
+-        Self::decode_object(&mut Cursor::new(&buf[8..]))
++        Self::decode_object(&mut Cursor::new(&buf[8..]), 0)
+     }
+ 
+-    fn decode_object(mut cursor: &mut Cursor<&[u8]>) -> Result<Self, IdeviceError> {
++    /// Objects nested deeper than this are rejected, so a hostile peer cannot
++    /// exhaust the stack.
++    const MAX_DEPTH: usize = 64;
++
++    /// Bytes left in `cursor`; a declared length beyond this is malformed and
++    /// is rejected before anything of that size is allocated.
++    fn remaining(cursor: &Cursor<&[u8]>) -> usize {
++        cursor
++            .get_ref()
++            .len()
++            .saturating_sub(cursor.position() as usize)
++    }
++
++    fn decode_object(mut cursor: &mut Cursor<&[u8]>, depth: usize) -> Result<Self, IdeviceError> {
++        if depth > Self::MAX_DEPTH {
++            return Err(XpcError::MalformedXpc.into());
++        }
+         let mut buf_32: [u8; 4] = Default::default();
+         cursor.read_exact(&mut buf_32)?;
+         let xpc_type = u32::from_le_bytes(buf_32);
+@@ -320,7 +336,7 @@ impl XPCObject {
+                     let padding = Self::calculate_padding(key.len() + 1);
+ 
+                     BufRead::consume(&mut cursor, padding);
+-                    ret.insert(key, Self::decode_object(cursor)?);
++                    ret.insert(key, Self::decode_object(cursor, depth + 1)?);
+                 }
+                 Ok(XPCObject::Dictionary(ret))
+             }
+@@ -332,7 +348,7 @@ impl XPCObject {
+ 
+                 let mut ret = Vec::new();
+                 for _i in 0..num_entries {
+-                    ret.push(Self::decode_object(cursor)?);
++                    ret.push(Self::decode_object(cursor, depth + 1)?);
+                 }
+                 Ok(XPCObject::Array(ret))
+             }
+@@ -365,6 +381,9 @@ impl XPCObject {
+                 // 'l' includes utf8 '\0' character.
+                 cursor.read_exact(&mut buf_32)?;
+                 let l = u32::from_le_bytes(buf_32) as usize;
++                if l > Self::remaining(cursor) {
++                    return Err(XpcError::MalformedXpc.into());
++                }
+                 let padding = Self::calculate_padding(l);
+ 
+                 let mut key_buf = vec![0; l];
+@@ -387,6 +406,9 @@ impl XPCObject {
+             XPCType::Data => {
+                 cursor.read_exact(&mut buf_32)?;
+                 let l = u32::from_le_bytes(buf_32) as usize;
++                if l > Self::remaining(cursor) {
++                    return Err(XpcError::MalformedXpc.into());
++                }
+                 let padding = Self::calculate_padding(l);
+ 
+                 let mut data = vec![0; l];
+@@ -405,7 +427,7 @@ impl XPCObject {
+                 let msg_id = u64::from_le_bytes(id_buf);
+ 
+                 // The next thing in the stream is a full XPC object
+-                let inner = Self::decode_object(cursor)?;
++                let inner = Self::decode_object(cursor, depth + 1)?;
+                 Ok(XPCObject::FileTransfer {
+                     msg_id,
+                     data: Box::new(inner),
+@@ -483,6 +505,9 @@ pub struct XPCMessage {
+     pub message_id: Option<u64>,
+ }
+ 
++/// Largest XPC message body accepted from a peer.
++const MAX_XPC_BODY_LEN: u64 = 128 * 1024 * 1024;
++
+ impl XPCMessage {
+     pub fn new(
+         flags: Option<XPCFlag>,
+@@ -515,7 +540,16 @@ impl XPCMessage {
+         let message_id = u64::from_le_bytes([
+             data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+         ]);
+-        if body_len + 24 > data.len() as u64 {
++        // A peer controls body_len: bound it, and add the header length
++        // without overflowing. The receive buffer waits for the whole body,
++        // so an unbounded claim would grow it without limit.
++        if body_len > MAX_XPC_BODY_LEN {
++            Err(XpcError::MalformedXpc)?
++        }
++        if body_len
++            .checked_add(24)
++            .is_none_or(|total| total > data.len() as u64)
++        {
+             warn!(
+                 "Body length is {body_len}, but received bytes is {}",
+                 data.len()
+@@ -592,3 +626,47 @@ impl std::fmt::Debug for XPCMessage {
+         )
+     }
+ }
++
++#[cfg(test)]
++mod hardening_tests {
++    use super::{XPCMessage, XPCObject};
++
++    fn hex(text: &str) -> Vec<u8> {
++        (0..text.len())
++            .step_by(2)
++            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap())
++            .collect()
++    }
++
++    #[test]
++    fn deeply_nested_object_is_an_error_not_a_stack_overflow() {
++        // Header, then 6000 nested one-entry dictionaries (key "", dictionary).
++        let mut input = hex("4237134205000000");
++        for _ in 0..6000 {
++            input.extend(hex("00e000000000000001000000"));
++        }
++        input.extend(hex("00100000"));
++        assert!(XPCObject::decode(&input).is_err());
++    }
++
++    #[test]
++    fn a_length_past_the_input_is_an_error_without_allocating_it() {
++        // A data object claiming 0xfffffff0 bytes in a 16-byte message is
++        // rejected as malformed before a buffer of that size is allocated
++        // (an allocation-then-short-read fails differently, as I/O).
++        let error = XPCObject::decode(&hex("423713420500000000800000f0ffffff")).unwrap_err();
++        assert!(
++            matches!(
++                error,
++                crate::IdeviceError::Xpc(crate::xpc::errors::XpcError::MalformedXpc)
++            ),
++            "{error:?}"
++        );
++    }
++
++    #[test]
++    fn a_body_length_that_overflows_is_an_error_not_a_panic() {
++        let input = hex("920bb02901000000e8ffffffffffffff00000000000000000000000000000000");
++        assert!(XPCMessage::decode(&input).is_err());
++    }
++}
 diff --git a/tools/src/hid.rs b/tools/src/hid.rs
 index 8393a1d89e7366effabddb7bb00f6411454ebf7c..5a3d90d6acd7c695c315c3aa4b31999a874a6620 100644
 --- a/tools/src/hid.rs
