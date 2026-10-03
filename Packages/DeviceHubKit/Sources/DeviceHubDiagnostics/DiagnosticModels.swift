@@ -322,16 +322,41 @@ public enum DiagnosticPersistenceFailure: Error, Equatable, Sendable {
 }
 
 /// Safe error classifications emitted by a diagnostics uploader.
-public enum DiagnosticUploadFailure: Error, Equatable, Sendable {
+public indirect enum DiagnosticUploadFailure: Error, Equatable, Sendable {
     case bodyTooLarge
     case cancelled
     case insecureEndpoint
     case invalidConfiguration
     case invalidPayload
+    /// Batches through the event with this sequence were accepted before
+    /// `failure` stopped the upload.
+    case partiallyDelivered(throughSequence: UInt64, failure: DiagnosticUploadFailure)
     case rejected(statusCode: Int)
     case responseTooLarge
     case timedOut
     case transportFailed
+
+    /// The failure that stopped the upload, without any partial delivery.
+    var stoppingFailure: DiagnosticUploadFailure {
+        if case let .partiallyDelivered(_, failure) = self {
+            return failure.stoppingFailure
+        }
+        return self
+    }
+
+    /// Whether sending the same events again can never succeed: the server
+    /// refused them for good (a 4xx other than timeout or rate limiting), or
+    /// they cannot be encoded within the limits.
+    var isPermanent: Bool {
+        switch stoppingFailure {
+        case let .rejected(statusCode):
+            (400 ..< 500).contains(statusCode) && statusCode != 408 && statusCode != 429
+        case .bodyTooLarge, .invalidPayload:
+            true
+        default:
+            false
+        }
+    }
 }
 
 /// A cancellable actor operation, used to retain cancellation context.
@@ -364,6 +389,8 @@ public struct DiagnosticSnapshot: Codable, Equatable, Sendable {
     }
 
     static let maximumUploadAge: TimeInterval = 7 * 24 * 60 * 60
+    /// How far ahead of now an event may be dated and still be uploaded.
+    static let maximumFutureSkew: TimeInterval = 5 * 60
 
     private(set) var segments: [Segment]
 

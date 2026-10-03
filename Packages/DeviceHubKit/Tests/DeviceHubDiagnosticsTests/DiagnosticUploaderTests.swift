@@ -101,6 +101,30 @@ struct DiagnosticUploaderTests {
         }
     }
 
+    @Test func reportsHowFarAPartlyDeliveredUploadGot() async throws {
+        let requests = LockedRequests()
+        DiagnosticURLProtocolStub.install { request in
+            requests.append(request)
+            let statusCode = requests.values.count == 1 ? 200 : 503
+            return (.fixture(url: request.url, statusCode: statusCode), Data())
+        }
+        let client = try makeClient()
+        let payload = try snapshot(eventCount: 201).encoded()
+
+        do {
+            try await client.upload(payload)
+            Issue.record("The failed second batch unexpectedly succeeded.")
+        } catch {
+            expectNoDifference(
+                error,
+                DiagnosticUploadFailure.partiallyDelivered(
+                    throughSequence: 100,
+                    failure: .rejected(statusCode: 503)
+                )
+            )
+        }
+    }
+
     @Test func mapsTransportTimeoutAndCancellationWithoutUnderlyingDetails() async throws {
         let payload = try snapshot(eventCount: 1).encoded()
         for (error, expectedFailure) in [

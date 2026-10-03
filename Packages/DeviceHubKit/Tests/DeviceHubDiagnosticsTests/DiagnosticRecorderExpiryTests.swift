@@ -65,6 +65,106 @@ struct DiagnosticRecorderExpiryTests {
         )
     }
 
+    /// A clock that ran ahead once must not wedge the outbox: the wire format
+    /// rejects events dated more than five minutes ahead, so pruning drops them.
+    @Test func foregroundFlushDropsEventsDatedTooFarAhead() async throws {
+        let now = Date(timeIntervalSince1970: 1_753_207_200)
+        let context = try diagnosticContext()
+        let persisted = try DiagnosticSnapshot(
+            context: context,
+            events: [
+                DiagnosticEvent(
+                    sequence: 1,
+                    timestamp: now.addingTimeInterval(-60),
+                    level: .info,
+                    category: .connection,
+                    stage: .ready,
+                    kind: .operationSucceeded
+                ),
+                DiagnosticEvent(
+                    sequence: 2,
+                    timestamp: now.addingTimeInterval(10 * 60),
+                    level: .info,
+                    category: .connection,
+                    stage: .ready,
+                    kind: .operationSucceeded
+                )
+            ]
+        ).encoded()
+        let persistence = PersistenceProbe(loadedPayload: persisted)
+        let uploader = UploadProbe()
+        let recorder = try DiagnosticRecorder(
+            context: context,
+            policy: DiagnosticRetentionPolicy(
+                maximumEventCount: 10,
+                maximumEncodedByteCount: 32 * 1024
+            ),
+            persistence: persistence.client,
+            uploader: uploader.client,
+            now: { now }
+        )
+        try await recorder.restore()
+
+        _ = try await recorder.flushOnForeground()
+
+        let uploadedPayload = try #require(await uploader.uploadedPayloads.first)
+        try expectNoDifference(
+            DiagnosticSnapshot.decode(uploadedPayload).events.map(\.sequence),
+            [1]
+        )
+    }
+
+    @Test(arguments: [
+        (DiagnosticUploadFailure.rejected(statusCode: 400), [UInt64]()),
+        (.rejected(statusCode: 422), []),
+        (.rejected(statusCode: 429), [1, 2]),
+        (.rejected(statusCode: 503), [1, 2]),
+        (.transportFailed, [1, 2]),
+        (.partiallyDelivered(throughSequence: 1, failure: .transportFailed), [2]),
+        (.partiallyDelivered(throughSequence: 1, failure: .rejected(statusCode: 400)), [])
+    ])
+    func failedFlushKeepsOnlyWhatCanStillBeDelivered(
+        failure: DiagnosticUploadFailure,
+        retained: [UInt64]
+    ) async throws {
+        let now = Date(timeIntervalSince1970: 1_753_207_200)
+        let context = try diagnosticContext()
+        let persisted = try DiagnosticSnapshot(
+            context: context,
+            events: (1 ... 2).map {
+                DiagnosticEvent(
+                    sequence: $0,
+                    timestamp: now.addingTimeInterval(-60),
+                    level: .info,
+                    category: .connection,
+                    stage: .ready,
+                    kind: .operationSucceeded
+                )
+            }
+        ).encoded()
+        let persistence = PersistenceProbe(loadedPayload: persisted)
+        let recorder = try DiagnosticRecorder(
+            context: context,
+            policy: DiagnosticRetentionPolicy(
+                maximumEventCount: 10,
+                maximumEncodedByteCount: 32 * 1024
+            ),
+            persistence: persistence.client,
+            uploader: UploadProbe(failure: failure).client,
+            now: { now }
+        )
+        try await recorder.restore()
+
+        await #expect(throws: DiagnosticError.self) {
+            try await recorder.flushOnForeground()
+        }
+
+        // Delivered events are dropped so a later batch cannot resend them
+        // under a new batch ID; a permanent rejection drops the rest too.
+        let remaining = await recorder.snapshot().events.map(\.sequence)
+        expectNoDifference(remaining, retained)
+    }
+
     @Test func entirelyExpiredSnapshotIsRemovedWithoutStartingTransport() async throws {
         let now = Date(timeIntervalSince1970: 1_753_207_200)
         let context = try diagnosticContext()

@@ -154,6 +154,34 @@ public extension DiagnosticUploadClient {
         let batchEncoder = DiagnosticWireBatchEncoder(
             context: configuration.context
         )
+        @Sendable
+        func sendEnvelope(_ envelope: DiagnosticWireEnvelope) async throws(DiagnosticUploadFailure) {
+            let body = try envelope.canonicalJSON()
+            guard body.count <= configuration.maximumRequestBodyByteCount else {
+                throw .bodyTooLarge
+            }
+
+            var request = URLRequest(url: configuration.endpoint)
+            request.httpMethod = "POST"
+            request.httpBody = body
+            request.timeoutInterval = configuration.requestTimeout
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            request.httpShouldHandleCookies = false
+            request.setValue(
+                configuration.bearerToken.authorizationHeader,
+                forHTTPHeaderField: "Authorization"
+            )
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+
+            try await send(
+                request,
+                using: session,
+                maximumResponseBodyByteCount: configuration.maximumResponseBodyByteCount
+            )
+        }
+
         return Self { payload async throws(DiagnosticUploadFailure) in
             guard !Task.isCancelled else {
                 throw .cancelled
@@ -170,48 +198,22 @@ public extension DiagnosticUploadClient {
                 from: snapshot,
                 now: now()
             )
+            // Reported on failure so the recorder drops what the server
+            // already has instead of sending it again under a new batch ID.
+            var deliveredThrough: UInt64?
             for envelope in envelopes {
                 guard !Task.isCancelled else {
                     throw .cancelled
                 }
-                let body = try envelope.canonicalJSON()
-                guard
-                    body.count <= configuration
-                    .maximumRequestBodyByteCount
-                else {
-                    throw .bodyTooLarge
+                do throws(DiagnosticUploadFailure) {
+                    try await sendEnvelope(envelope)
+                } catch {
+                    guard let deliveredThrough, error != .cancelled else {
+                        throw error
+                    }
+                    throw .partiallyDelivered(throughSequence: deliveredThrough, failure: error)
                 }
-
-                var request = URLRequest(url: configuration.endpoint)
-                request.httpMethod = "POST"
-                request.httpBody = body
-                request.timeoutInterval = configuration.requestTimeout
-                request.cachePolicy =
-                    .reloadIgnoringLocalAndRemoteCacheData
-                request.httpShouldHandleCookies = false
-                request.setValue(
-                    configuration.bearerToken.authorizationHeader,
-                    forHTTPHeaderField: "Authorization"
-                )
-                request.setValue(
-                    "application/json",
-                    forHTTPHeaderField: "Accept"
-                )
-                request.setValue(
-                    "application/json",
-                    forHTTPHeaderField: "Content-Type"
-                )
-                request.setValue(
-                    "no-store",
-                    forHTTPHeaderField: "Cache-Control"
-                )
-
-                try await send(
-                    request,
-                    using: session,
-                    maximumResponseBodyByteCount:
-                    configuration.maximumResponseBodyByteCount
-                )
+                deliveredThrough = envelope.events.last?.sequence ?? deliveredThrough
             }
         }
     }
