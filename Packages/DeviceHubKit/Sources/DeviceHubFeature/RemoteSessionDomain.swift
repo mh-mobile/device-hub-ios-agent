@@ -67,6 +67,29 @@ public extension RemoteSessionFeature {
             self.session = session
         }
 
+        /// Whether an ended session will be reconnected without the user:
+        /// the same conditions under which `reconnectEffect` arms its timer.
+        public var reconnectsAutomatically: Bool {
+            guard !isViewingStopped,
+                  let session,
+                  session.sessionID == nil,
+                  let error = session.connectionError
+            else {
+                return false
+            }
+            return error.retryability == .automatic
+                && reconnectAttempts < RemoteSessionFeature.maximumReconnectAttempts
+        }
+
+        /// The remediation to show, with copy that claims a reconnect only
+        /// while one is scheduled.
+        public var presentedRemediation: DeviceHubRemediation? {
+            guard let remediation, !reconnectsAutomatically else {
+                return remediation
+            }
+            return DeviceHubRemediation(error: remediation.error, recoversAutomatically: false)
+        }
+
         public var selectedDevice: DeviceSummary? {
             guard let selectedDeviceID else {
                 return nil

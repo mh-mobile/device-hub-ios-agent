@@ -158,6 +158,17 @@ struct DeviceHubErrorTests {
     }
 
     @Test
+    func manualRecoveryCopyNeverSaysTheAppIsRecovering() {
+        for error in DeviceHubError.allCases {
+            let message = error.manualRecoveryMessage.lowercased()
+            #expect(!message.isEmpty, "\(error)")
+            #expect(!message.contains("is reconnecting"), "\(error)")
+            #expect(!message.contains("is restarting"), "\(error)")
+            #expect(!message.contains("will reconnect"), "\(error)")
+        }
+    }
+
+    @Test
     func developerSupportErrorsGiveExactXcodePreparationGuidance() {
         expectNoDifference(
             DeviceHubError.developerImageUnavailable.userFacing,
