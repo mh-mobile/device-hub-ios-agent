@@ -127,21 +127,29 @@ struct RemotePairingBonjourLifecycleTests {
         #expect(stopCount == 1)
     }
 
-    @Test("callbacks after stop cannot revive a finished stream")
-    func callbacksAfterStopAreIgnored() async throws {
+    @Test(
+        "a callback from a stopped generation cannot reach the next one",
+        .timeLimit(.minutes(1))
+    )
+    func staleGenerationCallbacksAreIgnored() async throws {
         let browser = BrowserProbe()
         let transport = makeTransport(browser: browser)
-        let stream = await transport.availability()
-        var iterator = stream.makeAsyncIterator()
-        _ = try await iterator.next()
-
+        let first = await transport.availability()
+        var firstIterator = first.makeAsyncIterator()
+        _ = try await firstIterator.next()
         await transport.stopAvailability()
-        await transport.stopAvailability()
-        try await browser.emit(.resolved(resolvedService()))
+        #expect(try await firstIterator.next() == nil)
 
-        #expect(try await iterator.next() == nil)
-        let stopCount = await browser.stopCount
-        #expect(stopCount == 1)
+        let second = await transport.availability()
+        var secondIterator = second.makeAsyncIterator()
+        _ = try await secondIterator.next()
+        // The first generation's browser callback fires late. With a stale
+        // token it must not announce the device in the new generation.
+        try await browser.emitThroughFirstHandler(.resolved(resolvedService()))
+        try await Task.sleep(for: .milliseconds(200))
+
+        let retainedServices = await transport.browsingState?.servicesByName.count
+        #expect(retainedServices == 0)
     }
 
     @Test("browser startup failure terminates before availability")
@@ -157,6 +165,7 @@ struct RemotePairingBonjourLifecycleTests {
             .browserStartFailed(code: -65563),
             from: failingStream
         )
+        await failingBrowser.waitUntilStopped()
         let startFailureStopCount = await failingBrowser.stopCount
         #expect(startFailureStopCount == 1)
     }
@@ -180,6 +189,7 @@ struct RemotePairingBonjourLifecycleTests {
             .browserFailed(code: -72000),
             iterator: iterator
         )
+        await runtimeBrowser.waitUntilStopped()
         let runtimeFailureStopCount = await runtimeBrowser.stopCount
         #expect(runtimeFailureStopCount == 1)
     }
@@ -239,6 +249,7 @@ struct RemotePairingBonjourLifecycleTests {
             .publisherFailed(code: -72001),
             iterator: iterator
         )
+        await publisher.waitUntilStopped()
         let stopCount = await publisher.stopCount
         #expect(stopCount == 1)
     }
@@ -373,6 +384,7 @@ func resolvedService(
 
 actor BrowserProbe {
     private var handler: (@Sendable (BonjourBrowserEvent) -> Void)?
+    private var firstHandler: (@Sendable (BonjourBrowserEvent) -> Void)?
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var stopWaiters: [CheckedContinuation<Void, Never>] = []
     private let startFailure: BonjourNativeFailure?
@@ -407,6 +419,12 @@ actor BrowserProbe {
         handler?(event)
     }
 
+    /// Delivers through the handler of the first browse, as a late callback
+    /// from a stopped generation would.
+    func emitThroughFirstHandler(_ event: BonjourBrowserEvent) {
+        firstHandler?(event)
+    }
+
     func waitUntilStarted() async {
         guard startCount == 0 else {
             return
@@ -430,6 +448,7 @@ actor BrowserProbe {
     ) throws(BonjourNativeFailure) {
         startCount += 1
         self.handler = handler
+        firstHandler = firstHandler ?? handler
         startWaiters.forEach { $0.resume() }
         startWaiters.removeAll()
         if let startFailure {
@@ -449,6 +468,7 @@ actor PublisherProbe {
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var advertisement: PairableHostAdvertisement?
     private(set) var stopCount = 0
+    private var stopWaiters: [CheckedContinuation<Void, Never>] = []
 
     nonisolated var client: BonjourPublisherClient {
         BonjourPublisherClient(
@@ -487,8 +507,19 @@ actor PublisherProbe {
         startWaiters.removeAll()
     }
 
+    func waitUntilStopped() async {
+        guard stopCount == 0 else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            stopWaiters.append(continuation)
+        }
+    }
+
     private func stop() {
         stopCount += 1
+        stopWaiters.forEach { $0.resume() }
+        stopWaiters.removeAll()
     }
 }
 

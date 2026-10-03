@@ -116,6 +116,38 @@ struct DeviceHubConnectionLiveTests {
         #expect(outcome == .unreachable)
     }
 
+    @Test("a pairing store that cannot be read leaves the candidate unreachable, not rejected")
+    func unreadablePairingStoreIsUnreachable() async throws {
+        struct KeychainUnavailable: Error {}
+        let record = try fixtureRecord()
+        let persistence = try PersistenceProbe(
+            records: [record],
+            operations: OperationProbe()
+        )
+        var client = persistence.client
+        // The keychain is unavailable while the device is locked.
+        client.pairingRecords = { throw KeychainUnavailable() }
+        let native = NativeSessionClient(
+            capabilities: [.pairVerifyDiscovery],
+            makePairingSession: { _ async throws(NativeSessionFailure) in
+                throw unavailableNativeSessionFailure
+            },
+            makeRemoteSession: { _ async throws(NativeSessionFailure) in
+                throw unavailableNativeSessionFailure
+            },
+            verifyRemotePairing: { _ async throws(NativeSessionFailure) in }
+        )
+
+        let outcome = try await verifyRemotePairingCandidate(
+            deviceID: record.deviceID,
+            service: fixtureRemoteService(for: record),
+            nativeSessions: native,
+            pairingPersistence: client
+        )
+
+        #expect(outcome == .unreachable)
+    }
+
     @Test("a live session owns availability until disconnect")
     func liveSessionOwnsAvailability() async throws {
         let operations = OperationProbe()

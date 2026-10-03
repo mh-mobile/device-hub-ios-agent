@@ -185,6 +185,23 @@ public enum DeviceHubError: Error, CaseIterable, Codable, Hashable, Sendable {
         }
     }
 
+    /// Guidance for when no automatic recovery is scheduled: the reconnect
+    /// budget is spent, or the failure came from pairing or a command. The
+    /// automatically retried errors' usual copy says Device Hub is already
+    /// recovering, which would then be false.
+    public var manualRecoveryMessage: String {
+        switch self {
+        case .deviceOffline:
+            "Keep it awake and on the same network, then try again."
+        case .connectionLost:
+            "Keep both devices awake and nearby, then try again."
+        case .mediaStalled:
+            "Try again to restart the live view."
+        default:
+            userFacing.message
+        }
+    }
+
     public var userFacing: UserFacingCopy {
         switch self {
         case .localNetworkDenied:
