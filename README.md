@@ -85,8 +85,8 @@ DEVICE_HUB_AGENT_TOKEN = <output of: openssl rand -hex 24>
 ```
 
 Requests must come from loopback or a Tailscale address (100.64.0.0/10,
-fd7a:115c:a1e0::/48) and send `Authorization: Bearer <token>`; other sources get
-403 and missing or wrong tokens get 401. `Tools/agent-mcp/device_hub_mcp.py` is a
+fd7a:115c:a1e0::/48) and send `Authorization: Bearer <token>`. Connections from
+other sources are closed without a response, and missing or wrong tokens get 401. `Tools/agent-mcp/device_hub_mcp.py` is a
 stdio MCP server for it; it requires `DEVICE_HUB_URL` (the iPad's full tailnet
 name) and `DEVICE_HUB_AGENT_TOKEN`, ignores proxy settings, and does not follow
 redirects, so the token reaches only that URL.
