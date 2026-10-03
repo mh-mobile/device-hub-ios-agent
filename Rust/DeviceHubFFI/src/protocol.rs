@@ -53,6 +53,9 @@ use crate::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const PAIR_SETUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+// A peer that connects must start pairing promptly; a silent connection is
+// dropped so it cannot hold the one pairing slot for PAIR_SETUP_TIMEOUT.
+const PAIRING_FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 const RSD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -181,14 +184,7 @@ async fn run_pairing(
         DhSessionState::Running,
     )?;
 
-    let (stream, _) = listener.accept().await.map_err(|_| {
-        PublicFailure::new(
-            "pairing_listener_accept_failed",
-            "pairing_listener",
-            true,
-            "Unable to accept the device pairing connection.",
-        )
-    })?;
+    let stream = accept_pairing_peer(&listener, PAIRING_FIRST_MESSAGE_TIMEOUT).await?;
     emitter.phase(DhConnectionPhase::Pairing, DhSessionState::Running)?;
 
     let mut pairing_file = operation.controller.pairing_file(None);
@@ -2593,6 +2589,32 @@ fn pair_verify_failure(error: IdeviceError) -> PublicFailure {
     )
 }
 
+/// Accepts the first connection that starts talking within
+/// `first_message_timeout`. A connection that stays silent, or closes, is
+/// dropped and the next one is accepted, so a stray client cannot hold the
+/// only pairing slot until Pair Setup times out.
+async fn accept_pairing_peer(
+    listener: &TcpListener,
+    first_message_timeout: Duration,
+) -> Result<tokio::net::TcpStream, PublicFailure> {
+    loop {
+        let (stream, _) = listener.accept().await.map_err(|_| {
+            PublicFailure::new(
+                "pairing_listener_accept_failed",
+                "pairing_listener",
+                true,
+                "Unable to accept the device pairing connection.",
+            )
+        })?;
+        let mut first_byte = [0u8; 1];
+        if let Ok(Ok(1..)) =
+            tokio::time::timeout(first_message_timeout, stream.peek(&mut first_byte)).await
+        {
+            return Ok(stream);
+        }
+    }
+}
+
 fn bind_pairing_listener(port: u16) -> Result<TcpListener, PublicFailure> {
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).map_err(|_| {
         PublicFailure::new(
@@ -3688,6 +3710,31 @@ mod tests {
 
         assert_eq!(failed.ok(), Some(None));
         assert_eq!(answered.ok(), Some(Some(3)));
+    }
+
+    #[tokio::test]
+    async fn a_silent_pairing_connection_does_not_hold_the_listener() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _silent = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
+        peer.write_all(b"RPPairing").await.unwrap();
+
+        let mut accepted = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_pairing_peer(&listener, Duration::from_millis(100)),
+        )
+        .await
+        .expect("the real peer is accepted after the silent one times out")
+        .unwrap();
+
+        let mut first = [0u8; 9];
+        tokio::time::timeout(Duration::from_secs(5), accepted.read_exact(&mut first))
+            .await
+            .expect("the accepted connection is the one that sent data")
+            .unwrap();
+        assert_eq!(&first, b"RPPairing");
     }
 
     #[tokio::test]
