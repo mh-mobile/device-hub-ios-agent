@@ -15,6 +15,7 @@ enum KnownDeviceResolutionError: Error, Equatable, Sendable {
 struct KnownRemotePairingDevice:
     CustomDebugStringConvertible,
     CustomStringConvertible,
+    Equatable,
     Sendable
 {
     let deviceID: DeviceID

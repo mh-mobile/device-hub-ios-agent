@@ -108,6 +108,57 @@ extension RemotePairingBonjourLifecycleTests {
     }
 
     @Test(
+        "pairing another device keeps a verified device online without verifying again",
+        .timeLimit(.minutes(1))
+    )
+    func refreshKeepsUnchangedMatches() async throws {
+        let browser = BrowserProbe()
+        let knownDevices = KnownDevicesProbe()
+        let verifier = CandidateVerificationProbe(
+            authenticatedDeviceIDs: [DeviceID(rawValue: "test-phone")]
+        )
+        let testPhone = try KnownRemotePairingDevice(
+            deviceID: DeviceID(rawValue: "test-phone"),
+            alternateIRK: #require(Data(base64Encoded: "Mgp6ZGPzXM2ku9br46vsiw=="))
+        )
+        await knownDevices.replace(with: [testPhone])
+        let transport = makeTransport(
+            browser: browser,
+            verifyCandidate: verifier.verify,
+            loadKnownDevices: knownDevices.load
+        )
+        let stream = await transport.availability()
+        var iterator = stream.makeAsyncIterator()
+        _ = try await iterator.next()
+        try await browser.emit(.resolved(resolvedService()))
+        let online = [RemotePairingAvailability(
+            deviceID: DeviceID(rawValue: "test-phone"),
+            reachability: .reachable
+        )]
+        let first = try await iterator.next()
+        expectNoDifference(first, online)
+
+        // Another device is paired; test-phone's record is unchanged.
+        try await knownDevices.replace(with: [
+            testPhone,
+            KnownRemotePairingDevice(
+                deviceID: DeviceID(rawValue: "other-phone"),
+                alternateIRK: Data(repeating: 7, count: 16)
+            )
+        ])
+        try await transport.refreshKnownDevices()
+
+        // The newly paired device is listed too, unavailable until found.
+        let afterRefresh = try await iterator.next()
+        expectNoDifference(
+            afterRefresh?.first { $0.deviceID == DeviceID(rawValue: "test-phone") },
+            online.first
+        )
+        let verifications = await verifier.callCount
+        #expect(verifications == 1)
+    }
+
+    @Test(
         "an active control session suppresses competing Pair Verify probes"
     )
     func activeSessionSuppressesPairVerify() async throws {

@@ -267,14 +267,23 @@ public actor RemotePairingBonjourTransport {
         else {
             return
         }
+        // Pairing or forgetting another device keeps unchanged ones verified.
+        let unchangedDeviceIDs = Set(
+            knownDevices.filter(state.knownDevices.contains).map(\.deviceID)
+        )
         state.knownDevices = knownDevices
-        state.matchesByServiceName.removeAll()
+        state.matchesByServiceName = state.matchesByServiceName.filter {
+            unchangedDeviceIDs.contains($0.value)
+        }
         state.pendingVerificationServiceNames.removeAll()
         state.queuedVerificationServiceNames.removeAll()
         state.rejectedServiceNames.removeAll()
         var observations: [BonjourTransportObservation] = []
         for serviceName in state.servicesByName.keys.sorted() {
-            guard let service = state.servicesByName[serviceName] else {
+            guard
+                let service = state.servicesByName[serviceName],
+                state.matchesByServiceName[serviceName] == nil
+            else {
                 continue
             }
             state.nextCandidateRevision &+= 1
@@ -518,8 +527,11 @@ extension RemotePairingBonjourTransport {
         if state.servicesByName[serviceKey] == service {
             return
         }
+        // The cap bounds strangers only; a known (or ambiguous) device is let in.
+        let isKnown = (try? KnownDeviceResolver.resolve(service, among: state.knownDevices) != nil) ?? true
         guard
             state.servicesByName[serviceKey] != nil
+            || isKnown
             || state.servicesByName.count < 64
         else {
             await record(.unknownAnnouncement)
