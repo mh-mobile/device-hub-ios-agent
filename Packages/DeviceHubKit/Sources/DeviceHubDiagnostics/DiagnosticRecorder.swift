@@ -126,8 +126,13 @@ public actor DiagnosticRecorder {
         let expirationThreshold = now().addingTimeInterval(
             -DiagnosticSnapshot.maximumUploadAge
         )
+        // Events dated too far ahead (a clock that ran fast) are dropped as
+        // well: the wire format rejects them, which would wedge the outbox.
+        let futureThreshold = now().addingTimeInterval(
+            DiagnosticSnapshot.maximumFutureSkew
+        )
         let retainedSnapshot = buffer.snapshot.retainingEvents {
-            $0.timestamp >= expirationThreshold
+            $0.timestamp >= expirationThreshold && $0.timestamp <= futureThreshold
         }
         let expiredEventCount =
             buffer.events.count - retainedSnapshot.events.count
@@ -137,28 +142,12 @@ public actor DiagnosticRecorder {
                 throw DiagnosticError.cancelled(.foregroundFlush)
             }
 
+            try await replaceBuffer(with: retainedSnapshot)
             if retainedSnapshot.events.isEmpty {
-                do {
-                    try await persistence.clear()
-                } catch {
-                    throw DiagnosticError.persistence(error)
-                }
-                buffer = try DiagnosticBuffer(policy: policy)
                 return .discardedExpiredEvents(
                     eventCount: expiredEventCount
                 )
             }
-
-            let retainedData = try retainedSnapshot.encoded()
-            do {
-                try await persistence.save(retainedData)
-            } catch {
-                throw DiagnosticError.persistence(error)
-            }
-            buffer = try DiagnosticBuffer(
-                policy: policy,
-                snapshot: retainedSnapshot
-            )
         }
 
         let data = try buffer.snapshot.encoded()
@@ -169,7 +158,11 @@ public actor DiagnosticRecorder {
         } catch .cancelled {
             throw DiagnosticError.cancelled(.foregroundFlush)
         } catch {
-            throw DiagnosticError.upload(error)
+            try await keepUndeliveredEvents(after: error)
+            if error.stoppingFailure == .cancelled {
+                throw DiagnosticError.cancelled(.foregroundFlush)
+            }
+            throw DiagnosticError.upload(error.stoppingFailure)
         }
 
         guard !Task.isCancelled else {
@@ -188,6 +181,38 @@ public actor DiagnosticRecorder {
             expiredEventCount: expiredEventCount,
             encodedByteCount: data.count
         )
+    }
+
+    /// After a failed upload, drops what the server already accepted, so it is
+    /// not sent again under a new batch ID once eviction shifts the batches,
+    /// and drops everything when the server will never accept it.
+    private func keepUndeliveredEvents(
+        after failure: DiagnosticUploadFailure
+    ) async throws {
+        if failure.isPermanent {
+            try await replaceBuffer(with: buffer.snapshot.retainingEvents { _ in false })
+        } else if case let .partiallyDelivered(deliveredThrough, _) = failure {
+            try await replaceBuffer(
+                with: buffer.snapshot.retainingEvents { $0.sequence > deliveredThrough }
+            )
+        }
+    }
+
+    /// Persists `snapshot` (or clears storage when it is empty) and makes it
+    /// the buffer.
+    private func replaceBuffer(with snapshot: DiagnosticSnapshot) async throws {
+        do {
+            if snapshot.events.isEmpty {
+                try await persistence.clear()
+            } else {
+                try await persistence.save(snapshot.encoded())
+            }
+        } catch let error as DiagnosticPersistenceFailure {
+            throw DiagnosticError.persistence(error)
+        }
+        buffer = snapshot.events.isEmpty
+            ? try DiagnosticBuffer(policy: policy)
+            : try DiagnosticBuffer(policy: policy, snapshot: snapshot)
     }
 
     /// Returns the current retained snapshot without performing I/O.

@@ -35,7 +35,7 @@ public struct DiagnosticWireBatchEncoder: Sendable {
                 }
                 guard
                     event.sequence <= 1_000_000_000,
-                    event.occurredAt <= now.addingTimeInterval(5 * 60),
+                    event.occurredAt <= now.addingTimeInterval(DiagnosticSnapshot.maximumFutureSkew),
                     previousSequence.map({ event.sequence > $0 }) ?? true
                 else {
                     throw .invalidPayload

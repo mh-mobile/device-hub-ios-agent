@@ -101,6 +101,76 @@ struct DiagnosticUploaderTests {
         }
     }
 
+    @Test func reportsHowFarAPartlyDeliveredUploadGot() async throws {
+        let requests = LockedRequests()
+        DiagnosticURLProtocolStub.install { request in
+            requests.append(request)
+            let statusCode = requests.values.count == 1 ? 200 : 503
+            return (.fixture(url: request.url, statusCode: statusCode), Data())
+        }
+        let client = try makeClient()
+        let payload = try snapshot(eventCount: 201).encoded()
+
+        do {
+            try await client.upload(payload)
+            Issue.record("The failed second batch unexpectedly succeeded.")
+        } catch {
+            expectNoDifference(
+                error,
+                DiagnosticUploadFailure.partiallyDelivered(
+                    throughSequence: 100,
+                    failure: .rejected(statusCode: 503)
+                )
+            )
+        }
+    }
+
+    /// The server accepted batch two (a 2xx) before its response body failed,
+    /// so batch two counts as delivered too.
+    @Test func countsABatchDeliveredOnceTheServerAcceptsIt() async throws {
+        let requests = LockedRequests()
+        DiagnosticURLProtocolStub.install { request in
+            requests.append(request)
+            let body = requests.values.count == 1 ? Data() : Data(repeating: 0x20, count: 128)
+            return (.fixture(url: request.url, statusCode: 200), body)
+        }
+        let client = try makeClient(maximumResponseBodyByteCount: 64)
+        let payload = try snapshot(eventCount: 201).encoded()
+
+        do {
+            try await client.upload(payload)
+            Issue.record("The oversized response unexpectedly succeeded.")
+        } catch {
+            expectNoDifference(
+                error,
+                DiagnosticUploadFailure.partiallyDelivered(throughSequence: 200, failure: .responseTooLarge)
+            )
+        }
+    }
+
+    @Test func reportsDeliveredBatchesWhenCancelledPartWay() async throws {
+        let requests = LockedRequests()
+        DiagnosticURLProtocolStub.install { request in
+            requests.append(request)
+            guard requests.values.count == 1 else {
+                throw URLError(.cancelled)
+            }
+            return (.fixture(url: request.url, statusCode: 200), Data())
+        }
+        let client = try makeClient()
+        let payload = try snapshot(eventCount: 201).encoded()
+
+        do {
+            try await client.upload(payload)
+            Issue.record("The cancelled second batch unexpectedly succeeded.")
+        } catch {
+            expectNoDifference(
+                error,
+                DiagnosticUploadFailure.partiallyDelivered(throughSequence: 100, failure: .cancelled)
+            )
+        }
+    }
+
     @Test func mapsTransportTimeoutAndCancellationWithoutUnderlyingDetails() async throws {
         let payload = try snapshot(eventCount: 1).encoded()
         for (error, expectedFailure) in [
@@ -225,7 +295,10 @@ struct DiagnosticUploaderTests {
         await #expect(throws: DiagnosticUploadFailure.invalidPayload) {
             try await client.upload(Data("{}".utf8))
         }
-        await #expect(throws: DiagnosticUploadFailure.responseTooLarge) {
+        // The 201 means the batch was accepted; only its response was too big.
+        await #expect(
+            throws: DiagnosticUploadFailure.partiallyDelivered(throughSequence: 1, failure: .responseTooLarge)
+        ) {
             try await client.upload(snapshot(eventCount: 1).encoded())
         }
     }

@@ -154,6 +154,38 @@ public extension DiagnosticUploadClient {
         let batchEncoder = DiagnosticWireBatchEncoder(
             context: configuration.context
         )
+        @Sendable
+        func sendEnvelope(
+            _ envelope: DiagnosticWireEnvelope,
+            accepted: () -> Void
+        ) async throws(DiagnosticUploadFailure) {
+            let body = try envelope.canonicalJSON()
+            guard body.count <= configuration.maximumRequestBodyByteCount else {
+                throw .bodyTooLarge
+            }
+
+            var request = URLRequest(url: configuration.endpoint)
+            request.httpMethod = "POST"
+            request.httpBody = body
+            request.timeoutInterval = configuration.requestTimeout
+            request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            request.httpShouldHandleCookies = false
+            request.setValue(
+                configuration.bearerToken.authorizationHeader,
+                forHTTPHeaderField: "Authorization"
+            )
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+
+            try await send(
+                request,
+                using: session,
+                maximumResponseBodyByteCount: configuration.maximumResponseBodyByteCount,
+                accepted: accepted
+            )
+        }
+
         return Self { payload async throws(DiagnosticUploadFailure) in
             guard !Task.isCancelled else {
                 throw .cancelled
@@ -170,48 +202,26 @@ public extension DiagnosticUploadClient {
                 from: snapshot,
                 now: now()
             )
+            // Reported on any failure, cancellation included, so the recorder
+            // drops what the server already has instead of sending it again
+            // under a new batch ID.
+            var deliveredThrough: UInt64?
             for envelope in envelopes {
-                guard !Task.isCancelled else {
-                    throw .cancelled
+                do throws(DiagnosticUploadFailure) {
+                    guard !Task.isCancelled else {
+                        throw .cancelled
+                    }
+                    // A batch counts once the server accepts it (2xx), even if
+                    // reading the response body fails afterwards.
+                    try await sendEnvelope(envelope) {
+                        deliveredThrough = envelope.events.last?.sequence ?? deliveredThrough
+                    }
+                } catch {
+                    guard let deliveredThrough else {
+                        throw error
+                    }
+                    throw .partiallyDelivered(throughSequence: deliveredThrough, failure: error)
                 }
-                let body = try envelope.canonicalJSON()
-                guard
-                    body.count <= configuration
-                    .maximumRequestBodyByteCount
-                else {
-                    throw .bodyTooLarge
-                }
-
-                var request = URLRequest(url: configuration.endpoint)
-                request.httpMethod = "POST"
-                request.httpBody = body
-                request.timeoutInterval = configuration.requestTimeout
-                request.cachePolicy =
-                    .reloadIgnoringLocalAndRemoteCacheData
-                request.httpShouldHandleCookies = false
-                request.setValue(
-                    configuration.bearerToken.authorizationHeader,
-                    forHTTPHeaderField: "Authorization"
-                )
-                request.setValue(
-                    "application/json",
-                    forHTTPHeaderField: "Accept"
-                )
-                request.setValue(
-                    "application/json",
-                    forHTTPHeaderField: "Content-Type"
-                )
-                request.setValue(
-                    "no-store",
-                    forHTTPHeaderField: "Cache-Control"
-                )
-
-                try await send(
-                    request,
-                    using: session,
-                    maximumResponseBodyByteCount:
-                    configuration.maximumResponseBodyByteCount
-                )
             }
         }
     }
@@ -219,7 +229,8 @@ public extension DiagnosticUploadClient {
     private static func send(
         _ request: URLRequest,
         using session: URLSession,
-        maximumResponseBodyByteCount: Int
+        maximumResponseBodyByteCount: Int,
+        accepted: () -> Void
     ) async throws(DiagnosticUploadFailure) {
         do {
             let (responseBytes, response) = try await session.bytes(
@@ -236,6 +247,7 @@ public extension DiagnosticUploadClient {
                     statusCode: httpResponse.statusCode
                 )
             }
+            accepted()
 
             var receivedByteCount = 0
             for try await _ in responseBytes {
