@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+import subprocess
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -32,6 +35,34 @@ class CILocalGateContractTests(unittest.TestCase):
         self.assertIn("CONFIGURATION=Release", source)
         self.assertIn("CODE_SIGNING_ALLOWED=NO", source)
         self.assertIn("DEVICE_HUB_FULL_CI", source)
+
+    def test_checkout_state_sees_a_gate_rewriting_an_untracked_file(self) -> None:
+        function = re.search(r"checkout_state\(\) \{.*?\n\}", CI_PATH.read_text(), re.S)
+        self.assertIsNotNone(function)
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            for arguments in (
+                ("init", "-q"),
+                ("-c", "user.email=ci@example.com", "-c", "user.name=CI",
+                 "commit", "-q", "--allow-empty", "-m", "base"),
+            ):
+                subprocess.run(("git", *arguments), cwd=repository, check=True)
+            snapshot = repository / "new-scenario.png"
+            snapshot.write_text("recorded\n")
+
+            def state() -> str:
+                return subprocess.run(
+                    ("bash", "-c", f"{function.group(0)}\ncheckout_state"),
+                    cwd=repository,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+
+            before = state()
+            snapshot.write_text("rewritten by a gate\n")
+
+            self.assertNotEqual(before, state())
 
     def test_ci_keeps_the_outer_guard_while_nested_mise_tasks_reacquire_their_lock(self) -> None:
         source = CI_PATH.read_text()

@@ -122,7 +122,8 @@ public struct PairingFeature {
 
             case let .pairingFailed(error):
                 state.phase = .preparing
-                state.remediation = DeviceHubRemediation(error: error)
+                // Pairing never retries on its own.
+                state.remediation = DeviceHubRemediation(error: error, recoversAutomatically: false)
                 return .cancel(id: CancelID.preparationTimeout)
 
             case .preparationTimedOut:

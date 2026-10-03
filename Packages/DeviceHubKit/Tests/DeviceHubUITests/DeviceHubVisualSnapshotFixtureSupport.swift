@@ -87,6 +87,8 @@
                  .sessionEndedIPhoneDark,
                  .sessionEndedRemediationIPhoneDark,
                  .sessionEndedRemediationIPadDark,
+                 .reconnectExhaustedIPhoneDark,
+                 .reconnectExhaustedIPadDark,
                  .noticesUnavailableIPhoneDark,
                  .developerImageIncompatibleIPhoneDark,
                  .localNetworkDeniedIPadDark,
@@ -104,6 +106,7 @@
                  .xcodePreparationIPadLight,
                  .localNetworkDeniedIPadDark,
                  .sessionEndedRemediationIPadDark,
+                 .reconnectExhaustedIPadDark,
                  .viewingOnlyIPadLight:
                 .pad
             default:
@@ -120,6 +123,11 @@
             return idiom == .pad
                 ? CGSize(width: 1180, height: 820)
                 : CGSize(width: 440, height: 956)
+        }
+
+        /// No automatic reconnect is left, so the copy must ask the user.
+        var exhaustsReconnects: Bool {
+            self == .reconnectExhaustedIPhoneDark || self == .reconnectExhaustedIPadDark
         }
 
         var usesAccessibilityText: Bool {

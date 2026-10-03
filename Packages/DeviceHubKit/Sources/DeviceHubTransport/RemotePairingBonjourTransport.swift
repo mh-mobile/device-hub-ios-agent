@@ -45,6 +45,8 @@ public actor RemotePairingBonjourTransport {
         var queuedVerificationServiceNames: Set<String> = []
         var rejectedServiceNames: Set<String> = []
         var revisionsByServiceName: [String: UInt64] = [:]
+        /// Unreachable verifications in a row for each announcement revision.
+        var unreachableAttemptsByServiceName: [String: (revision: UInt64, count: Int)] = [:]
         var servicesByName: [
             String: ValidatedRemotePairingService
         ] = [:]
@@ -268,9 +270,7 @@ public actor RemotePairingBonjourTransport {
             return
         }
         // Pairing or forgetting another device keeps unchanged ones verified.
-        let unchangedDeviceIDs = Set(
-            knownDevices.filter(state.knownDevices.contains).map(\.deviceID)
-        )
+        let unchangedDeviceIDs = Set(knownDevices.filter(state.knownDevices.contains).map(\.deviceID))
         state.knownDevices = knownDevices
         state.matchesByServiceName = state.matchesByServiceName.filter {
             unchangedDeviceIDs.contains($0.value)

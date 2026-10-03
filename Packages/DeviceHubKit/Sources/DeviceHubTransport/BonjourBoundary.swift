@@ -168,3 +168,13 @@ enum BonjourTransportObservation: Equatable, Sendable {
     case resolutionFailed
     case unknownAnnouncement
 }
+
+/// The wait before the `attempt`th retry of a Bonjour step that keeps
+/// failing: doubling from `base` up to five minutes. A device that vanished
+/// without a goodbye stays announced for up to the mDNS TTL (75 minutes), so
+/// retries slow down instead of repeating every few seconds.
+func backedOffRetryDelay(base: Duration, attempt: Int) -> Duration {
+    let maximum = Duration.seconds(300)
+    let doublings = min(max(attempt - 1, 0), 16)
+    return min(base * (1 << doublings), maximum)
+}

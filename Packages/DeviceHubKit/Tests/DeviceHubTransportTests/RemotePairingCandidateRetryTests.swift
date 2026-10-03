@@ -36,6 +36,39 @@ struct RemotePairingCandidateRetryTests {
         #expect(await outcomes.callCount == 2)
     }
 
+    @Test("retries of an unreachable candidate back off up to a ceiling")
+    func retryDelayBacksOff() {
+        let delays = (1 ... 8).map {
+            backedOffRetryDelay(base: .seconds(5), attempt: $0)
+        }
+
+        #expect(delays == [5, 10, 20, 40, 80, 160, 300, 300].map { Duration.seconds($0) })
+    }
+
+    @Test(
+        "a candidate that stays unreachable is retried less and less often",
+        .timeLimit(.minutes(1))
+    )
+    func unreachableCandidateBacksOff() async throws {
+        let browser = BrowserProbe()
+        let outcomes = OutcomeSequence(Array(repeating: .unreachable, count: 100))
+        let transport = makeTransport(
+            browser: browser,
+            verifyCandidate: { _, _ in await outcomes.next() }
+        )
+        let stream = await transport.availability()
+        var iterator = stream.makeAsyncIterator()
+        _ = try await iterator.next()
+
+        try await browser.emit(.resolved(resolvedService()))
+        try await Task.sleep(for: .milliseconds(500))
+
+        // A fixed 10 ms delay would verify about 50 times in this window;
+        // doubling from 10 ms allows at most 6 (0, 10, 30, 70, 150, 310 ms).
+        #expect(await outcomes.callCount <= 7)
+        #expect(await outcomes.callCount >= 2)
+    }
+
     @Test(
         "unknown announcements cannot crowd out a known device",
         .timeLimit(.minutes(1))

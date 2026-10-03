@@ -10,19 +10,24 @@ reproduces exactly the tree whose digest is recorded.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import bootstrap_idevice
 
 
-def _git(checkout: Path, *arguments: str) -> bytes:
+def _git(checkout: Path, *arguments: str, index: Path | None = None) -> bytes:
+    environment = None if index is None else {**os.environ, "GIT_INDEX_FILE": str(index)}
     return subprocess.run(
         ("git", *arguments),
         cwd=checkout,
         check=True,
         capture_output=True,
+        env=environment,
     ).stdout
 
 
@@ -49,9 +54,18 @@ def regenerate(
             "remove ignored files from the idevice checkout first: " + ", ".join(ignored)
         )
 
-    # Intent-to-add makes new files part of the diff without staging content.
-    _git(checkout, "add", "--intent-to-add", "--all")
-    patch.write_bytes(_git(checkout, "diff", "--full-index", "--binary", revision))
+    # Intent-to-add makes new files part of the diff. It runs on a copy of the
+    # index so the checkout's own staging area is left as it was.
+    with tempfile.TemporaryDirectory() as scratch:
+        index = Path(scratch) / "index"
+        git_index = Path(_git(checkout, "rev-parse", "--git-path", "index").decode().strip())
+        git_index = git_index if git_index.is_absolute() else checkout / git_index
+        if git_index.exists():
+            shutil.copyfile(git_index, index)
+        _git(checkout, "add", "--intent-to-add", "--all", index=index)
+        patch.write_bytes(
+            _git(checkout, "diff", "--full-index", "--binary", revision, index=index)
+        )
 
     patch_sha256 = hashlib.sha256(patch.read_bytes()).hexdigest()
     tree_sha256 = bootstrap_idevice.tree_digest(checkout)
