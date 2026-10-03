@@ -82,6 +82,23 @@ class GuardedProcessTests(unittest.TestCase):
             )
         self.assertLess(time.monotonic() - started, 1.0 + 0.5)
 
+    def test_waiting_for_the_guarded_process_also_ends_by_the_deadline(self) -> None:
+        child = subprocess.Popen(("sleep", "30"))
+        try:
+            started = time.monotonic()
+            cleaned = guarded_process.terminate_process_session_members(
+                os.getpid() + 1_000_000,  # no such session
+                initial_signal=signal.SIGTERM,
+                grace_seconds=3.0,
+                process=child,
+                deadline=time.monotonic() + 0.3,
+            )
+            self.assertFalse(cleaned)
+            self.assertLess(time.monotonic() - started, 1.5)
+        finally:
+            child.kill()
+            child.wait()
+
     def test_parent_waits_past_the_watchdog_cleanup_deadline(self) -> None:
         for grace_seconds in (0.1, 5.0, 30.0):
             with self.subTest(grace_seconds=grace_seconds):
