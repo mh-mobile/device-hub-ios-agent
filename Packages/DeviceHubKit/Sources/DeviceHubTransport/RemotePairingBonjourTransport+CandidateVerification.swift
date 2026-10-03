@@ -166,6 +166,9 @@ extension RemotePairingBonjourTransport {
 
         activeCandidateDeviceID = nil
         activeCandidateServiceKey = nil
+        if outcome != .unreachable {
+            state.unreachableAttemptsByServiceName[job.serviceKey] = nil
+        }
         switch outcome {
         case .verified:
             state.rejectedServiceNames.remove(job.serviceKey)
@@ -177,8 +180,15 @@ extension RemotePairingBonjourTransport {
             browsingState = state
             await record(.unknownAnnouncement)
         case .unreachable:
+            let previous = state.unreachableAttemptsByServiceName[job.serviceKey]
+            let attempt = previous?.revision == job.revision ? (previous?.count ?? 0) + 1 : 1
+            state.unreachableAttemptsByServiceName[job.serviceKey] = (job.revision, attempt)
             browsingState = state
-            scheduleCandidateRetry(job, browsingToken: browsingToken)
+            scheduleCandidateRetry(
+                job,
+                browsingToken: browsingToken,
+                delay: backedOffRetryDelay(base: candidateRetryDelay, attempt: attempt)
+            )
         }
     }
 
@@ -186,9 +196,9 @@ extension RemotePairingBonjourTransport {
     /// browse generation still sees the same announcement unverified.
     private func scheduleCandidateRetry(
         _ job: CandidateVerificationJob,
-        browsingToken: UUID
+        browsingToken: UUID,
+        delay: Duration
     ) {
-        let delay = candidateRetryDelay
         Task { [weak self] in
             try? await Task.sleep(for: delay)
             await self?.retryCandidate(job, browsingToken: browsingToken)
