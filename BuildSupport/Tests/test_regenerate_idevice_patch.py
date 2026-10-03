@@ -55,6 +55,11 @@ class RegenerateIdevicePatchTests(unittest.TestCase):
                 f'IDEVICE_TREE_SHA256 = "{tree_sha}"\n',
             )
 
+            # The checkout's own index is untouched: nothing is staged and the
+            # new file is still untracked.
+            self.assertEqual(self.git(checkout, "diff", "--cached", "--name-only"), "")
+            self.assertIn("?? added.rs", self.git(checkout, "status", "--porcelain"))
+
             # The patch applies to a clean upstream checkout and reproduces the
             # same tree the digest was taken from.
             clean = root / "clean"

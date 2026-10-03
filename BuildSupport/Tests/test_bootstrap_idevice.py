@@ -245,6 +245,29 @@ class IDeviceBootstrapTests(unittest.TestCase):
         self.assertTrue(bootstrap_idevice.bootstrap(self.specification))
         self.assertFalse(stale.exists())
 
+    def test_backup_left_after_the_old_tree_was_moved_aside_is_restored(self) -> None:
+        # Killed between moving the old tree aside and installing the new one:
+        # the backup is the only copy, Cargo cache included.
+        self.assertTrue(bootstrap_idevice.bootstrap(self.specification))
+        (self.destination / "target").mkdir()
+        (self.destination / "target" / "cache").write_text("built\n")
+        backup = self.destination.parent / ".idevice-previous-killed"
+        self.destination.rename(backup)
+
+        self.assertFalse(bootstrap_idevice.bootstrap(self.specification))
+
+        self.assertEqual((self.destination / "target" / "cache").read_text(), "built\n")
+        self.assertEqual(self._temporary_bootstrap_paths(), [])
+
+    def test_backup_left_after_a_completed_replacement_is_removed(self) -> None:
+        self.assertTrue(bootstrap_idevice.bootstrap(self.specification))
+        backup = self.destination.parent / ".idevice-previous-killed"
+        (backup / "target").mkdir(parents=True)
+
+        self.assertFalse(bootstrap_idevice.bootstrap(self.specification))
+
+        self.assertEqual(self._temporary_bootstrap_paths(), [])
+
     def test_bootstrap_scratch_paths_are_ignored_by_git(self) -> None:
         for name in (
             ".idevice-bootstrap.lock",

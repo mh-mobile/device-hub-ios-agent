@@ -18,9 +18,11 @@ public struct DeviceHubRemediation: Equatable, Sendable {
     /// User-facing summary with protocol and transport details removed.
     public let title: String
 
-    public init(error: DeviceHubError) {
+    /// `recoversAutomatically` is false where nothing will retry on its own,
+    /// so the copy asks the user to try again instead.
+    public init(error: DeviceHubError, recoversAutomatically: Bool = true) {
         self.error = error
-        message = error.userFacing.message
+        message = recoversAutomatically ? error.userFacing.message : error.manualRecoveryMessage
         title = error.userFacing.title
     }
 

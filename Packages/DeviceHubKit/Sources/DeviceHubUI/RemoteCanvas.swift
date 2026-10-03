@@ -9,6 +9,7 @@ struct RemoteCanvas: View {
     let frame: RemoteDisplayFrame?
     let isViewingStopped: Bool
     let presentation: RemoteSessionPresentation?
+    let reconnectsAutomatically: Bool
     let remediation: DeviceHubRemediation?
     let screenInset: CGFloat
     let pairButtonTapped: () -> Void
@@ -84,10 +85,10 @@ struct RemoteCanvas: View {
                     symbolName: "wifi.slash",
                     title: "\(device.name) Is Offline"
                 )
-            } else if case let .ended(error) = presentation {
+            } else if case .ended = presentation {
                 CanvasMessage(
                     actionTitle: "Reconnect",
-                    message: error?.retryability == .automatic
+                    message: reconnectsAutomatically
                         ? "Device Hub will try again in a moment."
                         : "Reconnect when the device is ready.",
                     symbolName: "arrow.clockwise",
