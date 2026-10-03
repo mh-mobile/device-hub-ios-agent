@@ -305,6 +305,9 @@ private struct RemotePairingTXTFields {
         guard let rawTags = values[.authTag], !rawTags.isEmpty else {
             throw RemotePairingTXTError.missingField(.authTag)
         }
+        guard rawTags.count <= NativeRemoteService.maximumAuthenticationTagCount else {
+            throw RemotePairingTXTError.invalidAuthTag
+        }
 
         var tags: [Data] = []
         for rawTag in rawTags {

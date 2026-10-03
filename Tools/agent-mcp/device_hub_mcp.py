@@ -104,6 +104,18 @@ TOOLS = [
 ]
 
 
+# Newest first. The client's version is answered only if it is one of these;
+# otherwise the newest, and the client decides whether it can continue.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+
+def initialize_result(params):
+    requested = params.get("protocolVersion")
+    version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else SUPPORTED_PROTOCOL_VERSIONS[0]
+    return {"protocolVersion": version, "capabilities": {"tools": {}},
+            "serverInfo": {"name": "device-hub", "version": "0.1"}}
+
+
 def reply(id_, result=None, error=None):
     msg = {"jsonrpc": "2.0", "id": id_}
     msg.update({"error": error} if error else {"result": result})
@@ -122,8 +134,7 @@ def main():
         if id_ is None:
             continue  # notifications
         if method == "initialize":
-            reply(id_, {"protocolVersion": req.get("params", {}).get("protocolVersion", "2025-06-18"),
-                        "capabilities": {"tools": {}}, "serverInfo": {"name": "device-hub", "version": "0.1"}})
+            reply(id_, initialize_result(req.get("params") or {}))
         elif method == "tools/list":
             reply(id_, {"tools": TOOLS})
         elif method == "tools/call":

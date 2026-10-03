@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tomllib
 import unittest
 from pathlib import Path
@@ -32,6 +33,23 @@ class CILocalGateContractTests(unittest.TestCase):
         self.assertIn("CONFIGURATION=Release", source)
         self.assertIn("CODE_SIGNING_ALLOWED=NO", source)
         self.assertIn("DEVICE_HUB_FULL_CI", source)
+
+    def test_signing_material_and_secrets_are_ignored_by_git(self) -> None:
+        for name in (
+            "Config/Development.mobileprovision",
+            "Distribution.p12",
+            "AuthKey_ABC123.p8",
+            "signing/key.pem",
+            ".env",
+            ".env.local",
+        ):
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    ("git", "check-ignore", "-q", "--no-index", name),
+                    cwd=ROOT,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
 
     def test_ci_keeps_the_outer_guard_while_nested_mise_tasks_reacquire_their_lock(self) -> None:
         source = CI_PATH.read_text()
