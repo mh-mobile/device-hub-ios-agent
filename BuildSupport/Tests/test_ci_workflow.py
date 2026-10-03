@@ -36,6 +36,29 @@ class CILocalGateContractTests(unittest.TestCase):
         self.assertIn("CODE_SIGNING_ALLOWED=NO", source)
         self.assertIn("DEVICE_HUB_FULL_CI", source)
 
+    def test_signing_material_and_secrets_are_ignored_by_git(self) -> None:
+        for name in (
+            "Config/Development.mobileprovision",
+            "Distribution.p12",
+            "AuthKey_ABC123.p8",
+            "signing/key.pem",
+            ".env",
+            ".env.local",
+        ):
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    ("git", "check-ignore", "-q", "--no-index", name),
+                    cwd=ROOT,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
+
+        sample = subprocess.run(
+            ("git", "check-ignore", "-q", "--no-index", ".env.example"),
+            cwd=ROOT,
+            check=False,
+        )
+        self.assertEqual(sample.returncode, 1, ".env.example stays committable")
     def test_checkout_state_sees_a_gate_rewriting_an_untracked_file(self) -> None:
         function = re.search(r"checkout_state\(\) \{.*?\n\}", CI_PATH.read_text(), re.S)
         self.assertIsNotNone(function)

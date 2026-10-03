@@ -156,6 +156,25 @@ struct RemotePairingTXTTests {
         )
     }
 
+    @Test("an announcement with more auth tags than a session accepts is invalid")
+    func authTagCountMatchesTheSessionLimit() throws {
+        func entries(extraTags: Int) -> [(String, String)] {
+            var entries = validEntries()
+            for index in 0 ..< extraTags {
+                let tag = Data([0, 0, 0, 0, 1, UInt8(index)]).base64EncodedString()
+                entries.append(("authTag", tag))
+            }
+            return entries
+        }
+
+        // One tag comes from the valid fixture: 32 in all is accepted, 33 is
+        // rejected here rather than later as a damaged pairing record.
+        _ = try validatedService(entries: entries(extraTags: 31))
+        expectError(.invalidAuthTag) {
+            try validatedService(entries: entries(extraTags: 32))
+        }
+    }
+
     @Test("auth tags must be canonical base64 containing exactly six bytes")
     func authTagEncoding() {
         for value in [

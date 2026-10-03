@@ -603,7 +603,9 @@ public struct NativeRemoteService:
     public static let minimumWireProtocolVersion: UInt8 = 8
     public static let wireProtocolVersion: UInt8 = 26
 
-    private static let maximumAuthenticationTagCount = 32
+    /// Also enforced when an announcement is parsed, so a device announcing
+    /// more is invalid rather than surfacing later as damaged pairing data.
+    static let maximumAuthenticationTagCount = 32
 
     public var description: String {
         "<redacted-native-remote-service>"

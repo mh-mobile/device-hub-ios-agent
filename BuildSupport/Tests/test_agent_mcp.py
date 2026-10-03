@@ -69,6 +69,20 @@ class AgentMCPTests(unittest.TestCase):
                     mcp.http("GET", "/ok", timeout=5)
         self.assertEqual(proxy.requests, [])
 
+    def test_initialize_answers_only_with_a_supported_protocol_version(self):
+        mcp = _load()
+        newest = mcp.SUPPORTED_PROTOCOL_VERSIONS[0]
+        for requested, expected in (
+            ("2025-06-18", "2025-06-18"),
+            ("2025-03-26", "2025-03-26"),
+            ("2024-11-05", "2024-11-05"),
+            ("1999-01-01", newest),
+            (None, newest),
+        ):
+            with self.subTest(requested=requested):
+                params = {} if requested is None else {"protocolVersion": requested}
+                self.assertEqual(mcp.initialize_result(params)["protocolVersion"], expected)
+
     def test_missing_configuration_stops_before_serving(self):
         mcp = _load()
         for environment in ({}, {"DEVICE_HUB_URL": "http://ipad:8765"}, {"DEVICE_HUB_AGENT_TOKEN": "t" * 16}):

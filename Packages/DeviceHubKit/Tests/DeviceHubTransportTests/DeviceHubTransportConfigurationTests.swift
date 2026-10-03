@@ -157,32 +157,17 @@ struct DeviceHubTransportConfigurationTests {
 
     @Test("pairing and live control each fail closed on every required bit")
     func capabilityGates() async throws {
-        let pairingBits: [NativeSessionCapabilities] = [
-            .sessionLifecycle,
-            .generationTaggedEvents,
-            .sensitiveInputCopy,
-            .pairableHost,
-            .acknowledgedPairRecords
-        ]
-        let liveBits: [NativeSessionCapabilities] = [
-            .sessionLifecycle,
-            .generationTaggedEvents,
-            .sensitiveInputCopy,
-            .authenticatedReconnect,
-            .rsdMetadata,
-            .pngScreenshot,
-            .developerReadiness,
-            .controlStream,
-            .videoNegotiation,
-            .rawVideoDatagrams,
-            .hevcAccessUnits,
-            .touchInput,
-            .keyboardInput,
-            .hardwareButtonInput,
-            .rotation,
-            .splitMediaCallback,
-            .releaseAllInput
-        ]
+        /// Derived from the required sets, so a bit added there is covered
+        /// here too instead of silently skipped.
+        func bits(of set: NativeSessionCapabilities) -> [NativeSessionCapabilities] {
+            (0 ..< 64)
+                .map { NativeSessionCapabilities(rawValue: 1 << $0) }
+                .filter { set.contains($0) }
+        }
+        let pairingBits = bits(of: .requiredPairing)
+        let liveBits = bits(of: .requiredLiveControl)
+        #expect(pairingBits.count == 5)
+        #expect(liveBits.count == 19)
         let persistence = try PersistenceProbe(
             records: [fixtureRecord()]
         )

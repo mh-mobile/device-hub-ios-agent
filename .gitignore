@@ -21,3 +21,19 @@ Vendor/idevice/
 Vendor/.idevice-*
 build/
 xcuserdata/
+
+# Signing material and secrets never belong in the repository.
+*.mobileprovision
+*.provisionprofile
+*.p12
+*.pfx
+*.p8
+*.pem
+*.key
+*.cer
+*.certSigningRequest
+*.keychain-db
+.env
+.env.*
+# A sample with placeholder values may be committed.
+!.env.example
