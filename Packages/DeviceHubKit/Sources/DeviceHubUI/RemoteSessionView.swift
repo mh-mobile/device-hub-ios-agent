@@ -442,6 +442,7 @@ private struct DeviceTitleMenu: View {
                     // Toolbars draw labels icon-only by default; status must
                     // always be stated in words, not color alone.
                     .labelStyle(.titleAndIcon)
+                    .statusSymbolEffect(content.status)
                     .font(.caption2)
                     .foregroundStyle(headerStatusColor)
                     .lineLimit(1)
