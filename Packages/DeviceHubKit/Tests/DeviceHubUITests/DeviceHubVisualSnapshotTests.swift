@@ -58,6 +58,8 @@
         case liveLandscapeIPhoneTargetLandscapeDark
         case offlineIPhoneDark
         case sessionEndedIPhoneDark
+        case sessionEndedRemediationIPhoneDark
+        case sessionEndedRemediationIPadDark
         case lockedIPhoneAccessibility
         case developerModeIPadAccessibility
         case localNetworkDeniedIPadDark
@@ -246,9 +248,12 @@
                     selectedDeviceID: devices.offline.id
                 )
 
-            case .sessionEndedIPhoneDark:
-                // The remediation was dismissed; the canvas must still offer
-                // a way back instead of an endless spinner.
+            case .sessionEndedIPhoneDark,
+                 .sessionEndedRemediationIPhoneDark,
+                 .sessionEndedRemediationIPadDark:
+                // Dismissed remediation: the canvas must still offer a way
+                // back instead of an endless spinner. Open remediation: only
+                // the panel shows, not a second Reconnect message behind it.
                 var session = ActiveRemoteSession(
                     attemptID: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9)),
                     device: reachableDevice,
@@ -256,6 +261,9 @@
                 )
                 session.connectionError = .connectionLost
                 return RemoteSessionFeature.State(
+                    remediation: scenario == .sessionEndedIPhoneDark
+                        ? nil
+                        : DeviceHubRemediation(error: .connectionLost),
                     roster: roster,
                     selectedDeviceID: reachableDevice.id,
                     session: session

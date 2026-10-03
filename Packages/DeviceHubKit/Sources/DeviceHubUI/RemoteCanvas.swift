@@ -27,7 +27,9 @@ struct RemoteCanvas: View {
 
                 if hasScreenContent {
                     remoteScreen(in: geometry.size)
-                } else {
+                } else if remediation == nil {
+                    // The remediation panel carries its own action; a second
+                    // message behind it would overlap.
                     canvasPlaceholder
                 }
 

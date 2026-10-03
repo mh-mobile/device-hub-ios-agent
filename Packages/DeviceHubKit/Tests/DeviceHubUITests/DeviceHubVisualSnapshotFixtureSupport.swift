@@ -85,6 +85,8 @@
                  .liveLandscapeIPhoneTargetLandscapeDark,
                  .offlineIPhoneDark,
                  .sessionEndedIPhoneDark,
+                 .sessionEndedRemediationIPhoneDark,
+                 .sessionEndedRemediationIPadDark,
                  .noticesUnavailableIPhoneDark,
                  .developerImageIncompatibleIPhoneDark,
                  .localNetworkDeniedIPadDark,
@@ -101,6 +103,7 @@
                  .developerImageUnavailableIPadLight,
                  .xcodePreparationIPadLight,
                  .localNetworkDeniedIPadDark,
+                 .sessionEndedRemediationIPadDark,
                  .viewingOnlyIPadLight:
                 .pad
             default:
