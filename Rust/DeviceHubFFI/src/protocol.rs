@@ -2225,16 +2225,32 @@ const fn orientation_state_failed() -> PublicFailure {
 /// the whole session otherwise), so RTCP, malformed packets, and header-only or
 /// padding-only RTP are dropped here instead of reaching the controller.
 fn audio_rtp_packet(datagram: &[u8]) -> Option<RtpPacket<'_>> {
-    // Not `is_rtcp`: its RFC 5761 range (192..=223) is safe for video, whose
-    // payload type is negotiated outside 64..=95, but audio's is not, so a
-    // marked audio packet could land there. Only the RTCP types in use (SR
-    // through PSFB) are dropped.
-    if datagram.len() >= 4 && datagram[0] >> 6 == 2 && (200..=206).contains(&datagram[1]) {
+    if is_audio_rtcp(datagram) {
         return None;
     }
     RtpPacket::parse_checked(datagram)
         .ok()
         .filter(|packet| !packet.payload.is_empty())
+}
+
+/// Whether an audio datagram is RTCP. Audio's payload type is not negotiated
+/// away from 64..=95, so a marked RTP packet can carry the same second byte as
+/// RTCP (RFC 5761). RTCP's length fields must instead account for the whole
+/// datagram, alone or compound; an RTP sequence number does so only by
+/// coincidence.
+fn is_audio_rtcp(datagram: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset < datagram.len() {
+        let Some(header) = datagram.get(offset..offset + 4) else {
+            return false;
+        };
+        if header[0] >> 6 != 2 || !(192..=223).contains(&header[1]) {
+            return false;
+        }
+        let words = usize::from(u16::from_be_bytes([header[2], header[3]]));
+        offset += (words + 1) * 4;
+    }
+    offset == datagram.len() && !datagram.is_empty()
 }
 
 /// Whether an established video stream has gone silent for too long.
@@ -2836,12 +2852,27 @@ mod tests {
                 "marked audio with payload type {payload_type}"
             );
         }
-        for packet_type in 200_u8..=206 {
+        // Any RTCP packet type, XR (207) included, whose length fields
+        // account for the whole datagram, alone or compound.
+        // Each is 16 bytes (length field 3), long enough to parse as RTP.
+        for packet_type in 200_u8..=207 {
+            let mut report = vec![0x81, packet_type, 0x00, 0x03];
+            report.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]);
             assert!(
-                audio_rtp_packet(&[0x81, packet_type, 0x00, 0x01, 0, 0, 0, 1, 0xAB]).is_none(),
+                audio_rtp_packet(&report).is_none(),
                 "RTCP packet type {packet_type}"
             );
+            let mut compound = report.clone();
+            compound.extend_from_slice(&[0x80, 202, 0x00, 0x01, 0, 0, 0, 1]);
+            assert!(
+                audio_rtp_packet(&compound).is_none(),
+                "compound with {packet_type}"
+            );
         }
+        // Marked RTP with payload type 79 carries the same second byte as
+        // XR; its sequence number does not describe the datagram's length.
+        let marked = [0x80, 0x80 | 79, 0x00, 0x01, 0, 0, 0, 1, 0, 0, 0, 2, 0xAB];
+        assert!(audio_rtp_packet(&marked).is_some());
     }
 
     #[test]
