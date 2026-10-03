@@ -343,6 +343,8 @@ def background_processes_requiring_cleanup(
 
 def process_session_members(
     process_session_id: int,
+    *,
+    deadline: float | None = None,
 ) -> tuple[ProcessSessionMember, ...]:
     """Return processes that still belong to one operation-owned POSIX session.
 
@@ -353,6 +355,12 @@ def process_session_members(
     executable = str(process_status_executable())
     failure: BaseException | None = None
     for _ in range(PROCESS_INSPECTION_ATTEMPTS):
+        # Each run gets the usual timeout, cut short by the caller's deadline.
+        timeout = PROCESS_INSPECTION_TIMEOUT_SECONDS
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise OSError("could not inspect the guarded process session") from failure
         try:
             inspection = subprocess.run(
                 [executable, "-axo", "pid=,ppid=,comm="],
@@ -360,7 +368,7 @@ def process_session_members(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=PROCESS_INSPECTION_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             failure = error
@@ -513,11 +521,20 @@ def terminate_process_session_members(
     grace_seconds: float,
     process: subprocess.Popen[bytes] | None = None,
     preserve_managed_simulator_services: bool = False,
+    deadline: float | None = None,
 ) -> bool:
-    """Boundedly terminate every same-session process, including new groups."""
+    """Boundedly terminate every same-session process, including new groups.
+
+    With a `deadline`, every inspection and wait ends by it; inspecting past
+    it raises OSError so the caller can fall back.
+    """
+
+    def until(seconds: float) -> float:
+        bound = time.monotonic() + seconds
+        return bound if deadline is None else min(bound, deadline)
 
     members = background_processes_requiring_cleanup(
-        process_session_members(process_session_id),
+        process_session_members(process_session_id, deadline=deadline),
         preserve_managed_simulator_services=(preserve_managed_simulator_services),
     )
     if members:
@@ -529,15 +546,15 @@ def terminate_process_session_members(
         wait_for_known_session_members(
             process_session_id,
             members,
-            deadline=time.monotonic() + grace_seconds,
+            deadline=until(grace_seconds),
             process=process,
         )
 
     remaining = background_processes_requiring_cleanup(
-        process_session_members(process_session_id),
+        process_session_members(process_session_id, deadline=deadline),
         preserve_managed_simulator_services=(preserve_managed_simulator_services),
     )
-    kill_deadline = time.monotonic() + max(grace_seconds, 0.1)
+    kill_deadline = until(max(grace_seconds, 0.1))
     kill_sweeps = 0
     while (
         remaining
@@ -557,7 +574,7 @@ def terminate_process_session_members(
             process=process,
         )
         remaining = background_processes_requiring_cleanup(
-            process_session_members(process_session_id),
+            process_session_members(process_session_id, deadline=deadline),
             preserve_managed_simulator_services=(preserve_managed_simulator_services),
         )
 
@@ -567,7 +584,7 @@ def terminate_process_session_members(
         except subprocess.TimeoutExpired:
             return False
     return not background_processes_requiring_cleanup(
-        process_session_members(process_session_id),
+        process_session_members(process_session_id, deadline=deadline),
         preserve_managed_simulator_services=(preserve_managed_simulator_services),
     )
 
@@ -669,33 +686,49 @@ def terminate_external_process_session(
     process_session_id: int,
     *,
     grace_seconds: float,
+    deadline: float,
 ) -> None:
-    """Best-effort cleanup of all session members from the parent watchdog."""
+    """Best-effort cleanup of all session members from the parent watchdog.
+
+    Everything ends by `deadline`: member cleanup stops a grace period early
+    so the session-leader fallback still has its time.
+    """
 
     try:
         cleaned = terminate_process_session_members(
             process_session_id,
             initial_signal=signal.SIGTERM,
             grace_seconds=grace_seconds,
+            deadline=deadline - grace_seconds,
         )
     except OSError:
         cleaned = False
     if not cleaned:
         terminate_external_session_leader(
             process_session_id,
-            grace_seconds=grace_seconds,
+            grace_seconds=max(min(grace_seconds, deadline - time.monotonic()), 0.0),
         )
 
 
-def watchdog_supervision_timeout(grace_seconds: float) -> float:
-    """How long the parent waits for its watchdog before killing it.
+def watchdog_cleanup_budget(grace_seconds: float) -> float:
+    """How long the watchdog's cleanup may take, end to end.
 
-    The watchdog's cleanup inspects the session at least twice, and each
-    inspection may take every attempt on a heavily loaded host.
+    Cleanup is cut off at this deadline (see `terminate_external_process_session`)
+    rather than estimated from how often it inspects the session.
     """
 
     one_inspection = PROCESS_INSPECTION_ATTEMPTS * PROCESS_INSPECTION_TIMEOUT_SECONDS
     return max(grace_seconds * 3, 5.0) + 2 * one_inspection
+
+
+# Covers the watchdog noticing the closed pipe and exiting after its cleanup.
+WATCHDOG_SUPERVISION_MARGIN_SECONDS = 10.0
+
+
+def watchdog_supervision_timeout(grace_seconds: float) -> float:
+    """How long the parent waits for its watchdog before killing it."""
+
+    return watchdog_cleanup_budget(grace_seconds) + WATCHDOG_SUPERVISION_MARGIN_SECONDS
 
 
 def watchdog_main(arguments: Sequence[str]) -> int:
@@ -737,6 +770,7 @@ def watchdog_main(arguments: Sequence[str]) -> int:
     terminate_external_process_session(
         namespace.process_session_id,
         grace_seconds=namespace.grace_seconds,
+        deadline=time.monotonic() + watchdog_cleanup_budget(namespace.grace_seconds),
     )
     return 0
 
