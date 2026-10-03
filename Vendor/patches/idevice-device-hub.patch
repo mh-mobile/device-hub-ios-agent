@@ -2587,7 +2587,7 @@ index 473ce93d8fc223fd5fbb3281a1489855a19a94d9..3c5996727738f6f941e4c8370bcb319d
 +    }
 +}
 diff --git a/idevice/src/remote_pairing/tls_psk.rs b/idevice/src/remote_pairing/tls_psk.rs
-index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..84d260ece52d6ad8514eab5929b588e2422be419 100644
+index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..d0fe77c563d3ecd7d7c6e23f3bd401e9d8e39cf7 100644
 --- a/idevice/src/remote_pairing/tls_psk.rs
 +++ b/idevice/src/remote_pairing/tls_psk.rs
 @@ -14,16 +14,21 @@ use std::pin::Pin;
@@ -3180,14 +3180,24 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..84d260ece52d6ad8514eab5929b588e2
      fn poll_read(
          self: Pin<&mut Self>,
          cx: &mut Context<'_>,
-@@ -611,6 +809,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
+@@ -611,6 +809,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
                  match decrypt_record(&this.keys, true, this.read_seq, ct, &body) {
                      Ok(plaintext) => {
                          this.read_seq += 1;
 +                        match ct {
 +                            CT_APPLICATION_DATA => {}
-+                            // The peer is closing (or failing) the connection.
-+                            CT_ALERT => return Poll::Ready(Ok(())),
++                            // close_notify (description 0) is a clean close;
++                            // any other alert reports a failure, such as a bad
++                            // record MAC, and must not read as end of stream.
++                            CT_ALERT if plaintext.get(1) == Some(&0) => {
++                                return Poll::Ready(Ok(()));
++                            }
++                            CT_ALERT => {
++                                return Poll::Ready(Err(std::io::Error::other(format!(
++                                    "TLS alert {:?} from the peer",
++                                    plaintext.get(1)
++                                ))));
++                            }
 +                            _ => {
 +                                return Poll::Ready(Err(std::io::Error::other(format!(
 +                                    "unexpected TLS record type {ct} after the handshake"
@@ -3202,7 +3212,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..84d260ece52d6ad8514eab5929b588e2
                          let n = buf.remaining().min(plaintext.len());
                          buf.put_slice(&plaintext[..n]);
                          if n < plaintext.len() {
-@@ -650,7 +863,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
+@@ -650,7 +873,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
      }
  }
  
@@ -3253,7 +3263,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..84d260ece52d6ad8514eab5929b588e2
      fn poll_write(
          self: Pin<&mut Self>,
          cx: &mut Context<'_>,
-@@ -658,63 +913,647 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncWrite for TlsPskStrea
+@@ -658,63 +923,656 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncWrite for TlsPskStrea
      ) -> Poll<std::io::Result<usize>> {
          let this = self.get_mut();
  
@@ -3665,6 +3675,15 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..84d260ece52d6ad8514eab5929b588e2
 +        let mut stream = read_stream(&[(0x15, &[1, 0][..]), (CT_APPLICATION_DATA, b"late")]).await;
 +        let mut buf = [0u8; 8];
 +        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
++    }
++
++    #[tokio::test]
++    async fn a_fatal_alert_is_an_error_not_a_clean_close() {
++        use tokio::io::AsyncReadExt;
++        // fatal (2), bad_record_mac (20).
++        let mut stream = read_stream(&[(0x15, &[2, 20][..])]).await;
++        let mut buf = [0u8; 8];
++        assert!(stream.read(&mut buf).await.is_err());
 +    }
 +
 +    #[tokio::test]
