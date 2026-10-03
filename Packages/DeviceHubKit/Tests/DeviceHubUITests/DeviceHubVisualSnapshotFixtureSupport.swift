@@ -17,11 +17,20 @@
     }
 
     enum FixtureRemoteScreen {
+        case phoneLandscape
         case phonePortrait
         case tabletLandscape
 
         var geometry: FixtureRemoteGeometry {
             switch self {
+            case .phoneLandscape:
+                FixtureRemoteGeometry(
+                    imageHeight: 393,
+                    imageWidth: 852,
+                    orientation: .landscapeLeft,
+                    pixelSize: PixelSize(width: 1179, height: 2556)
+                )
+
             case .phonePortrait:
                 FixtureRemoteGeometry(
                     imageHeight: 852,
@@ -73,7 +82,11 @@
             case .pairingIPhoneDark,
                  .liveIPhoneDark,
                  .liveLandscapeIPadTargetIPhoneDark,
+                 .liveLandscapeIPhoneTargetLandscapeDark,
                  .offlineIPhoneDark,
+                 .sessionEndedIPhoneDark,
+                 .sessionEndedRemediationIPhoneDark,
+                 .sessionEndedRemediationIPadDark,
                  .noticesUnavailableIPhoneDark,
                  .developerImageIncompatibleIPhoneDark,
                  .localNetworkDeniedIPadDark,
@@ -90,6 +103,7 @@
                  .developerImageUnavailableIPadLight,
                  .xcodePreparationIPadLight,
                  .localNetworkDeniedIPadDark,
+                 .sessionEndedRemediationIPadDark,
                  .viewingOnlyIPadLight:
                 .pad
             default:
@@ -98,7 +112,9 @@
         }
 
         var size: CGSize {
-            if self == .liveLandscapeIPadTargetIPhoneDark {
+            if self == .liveLandscapeIPadTargetIPhoneDark
+                || self == .liveLandscapeIPhoneTargetLandscapeDark
+            {
                 return CGSize(width: 956, height: 440)
             }
             return idiom == .pad

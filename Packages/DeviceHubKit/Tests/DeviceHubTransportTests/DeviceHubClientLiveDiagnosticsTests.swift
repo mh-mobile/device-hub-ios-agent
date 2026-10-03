@@ -89,10 +89,6 @@ extension DeviceHubClientLiveTests {
             ) == .decoding
         )
         #expect(
-            mediaDiagnosticStage(for: .outputFrameDropped)
-                == .displayStalled
-        )
-        #expect(
             mediaDiagnosticStage(for: .outputFrameMissing)
                 == .displayStopped
         )

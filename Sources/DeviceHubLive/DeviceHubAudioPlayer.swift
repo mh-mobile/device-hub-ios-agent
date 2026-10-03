@@ -35,7 +35,7 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
 
     init?() {
         var description = AudioStreamBasicDescription(
-            mSampleRate: 44_100,
+            mSampleRate: 44100,
             mFormatID: kAudioFormatMPEG4AAC_ELD,
             mFormatFlags: 0,
             mBytesPerPacket: 0,
@@ -48,7 +48,7 @@ final class DeviceHubAudioPlayer: @unchecked Sendable {
         guard
             let compressedFormat = AVAudioFormat(streamDescription: &description),
             let pcmFormat = AVAudioFormat(
-                standardFormatWithSampleRate: 44_100,
+                standardFormatWithSampleRate: 44100,
                 channels: 2
             ),
             let converter = AVAudioConverter(from: compressedFormat, to: pcmFormat)

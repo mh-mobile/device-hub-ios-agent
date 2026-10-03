@@ -18,6 +18,8 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>DeviceHubAgentToken</key>
+	<string>$(DEVICE_HUB_AGENT_TOKEN)</string>
 	<key>DeviceHubDiagnosticsBearerToken</key>
 	<string>$(DEVICE_HUB_DIAGNOSTICS_TOKEN)</string>
 	<key>DeviceHubDiagnosticsEndpoint</key>

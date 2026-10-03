@@ -29,7 +29,13 @@
                 tappedModifiers.append(modifiers)
             }
 
-            textField.insertText("a ")
+            // Software keyboard text arrives through the delegate. Calling
+            // insertText on a field that is not editing does not reach it.
+            _ = textField.textField(
+                textField,
+                shouldChangeCharactersIn: NSRange(location: 0, length: 0),
+                replacementString: "a "
+            )
             textField.deleteBackward()
 
             #expect(

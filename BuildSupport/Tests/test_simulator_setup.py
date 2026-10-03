@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import subprocess
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -273,12 +275,82 @@ class SimulatorSetupTests(unittest.TestCase):
                 self.assertNotIn("DEVICE_HUB_SIMULATOR_LEASE_HELD", contents)
                 self.assertNotIn("CI_SIMULATOR_UDID", contents)
 
+    def test_entrypoints_enter_the_lease_before_the_process_guard(self) -> None:
+        for relative_path in (
+            Path("ci/run_ci.sh"),
+            Path("Scripts/test-app.sh"),
+            Path("Sources/DeviceHubPrivateMedia/Tests/run-tests.sh"),
+        ):
+            with self.subTest(path=relative_path):
+                contents = (ROOT / relative_path).read_text()
+                lease = contents.find("devicehub_enter_simulator_lease ")
+                guard = contents.find("devicehub_require_guard ")
+
+                self.assertNotEqual(lease, -1)
+                self.assertLess(lease, guard)
+
+    def test_lease_reexecution_does_not_contend_with_its_own_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_directory = root / "bin"
+            bin_directory.mkdir()
+            fake_lease = bin_directory / "codex-simulator-lease"
+            # Like the real supervisor, re-run the command with only stdio.
+            fake_lease.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, subprocess, sys\n"
+                "arguments = sys.argv[sys.argv.index('--') + 1:]\n"
+                "environment = dict(os.environ, CODEX_SIMULATOR_LEASE_ID='lease',"
+                " CODEX_SIMULATOR_LEASE_COMMAND=sys.argv[0])\n"
+                "sys.exit(subprocess.run(arguments, env=environment).returncode)\n"
+            )
+            fake_lease.chmod(0o755)
+            fixture = root / "fixture.sh"
+            fixture.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        f"ROOT={str(ROOT)!r}",
+                        'source "$ROOT/BuildSupport/process_guard.sh"',
+                        'source "$ROOT/BuildSupport/simulator_guard.sh"',
+                        'devicehub_enter_simulator_lease fixture 5 "$0" "$@"',
+                        'devicehub_require_guard fixture 5 "$0" "$@"',
+                        'test "$CODEX_SIMULATOR_LEASE_ID" = lease',
+                        "",
+                    ]
+                )
+            )
+            fixture.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = f"{bin_directory}:{environment['PATH']}"
+            environment["DEVICE_HUB_GUARD_LOCK_PATH"] = str(root / "guard.lock")
+            for name in (
+                "CODEX_SIMULATOR_LEASE_COMMAND",
+                "CODEX_SIMULATOR_LEASE_ID",
+                "DEVICE_HUB_SIMULATOR_SETUP_MODE",
+                "DEVICE_HUB_SIMULATOR_UDID",
+                "DEVICE_HUB_GUARD_HELD",
+                "DEVICE_HUB_GUARD_FD",
+            ):
+                environment.pop(name, None)
+
+            result = subprocess.run(
+                [str(fixture)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_outer_wrapper_discards_stale_project_udid(self) -> None:
         contents = (ROOT / "BuildSupport" / "simulator_guard.sh").read_text()
 
         self.assertIn("unset DEVICE_HUB_SIMULATOR_UDID", contents)
         self.assertIn("CODEX_SIMULATOR_LEASE_ID", contents)
-        self.assertIn("CODEX_SIMULATOR_LEASE_COMMAND", contents)
         self.assertIn("DEVICE_HUB_SIMULATOR_CLEANUP_REQUIRED", contents)
 
 

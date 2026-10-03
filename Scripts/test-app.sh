@@ -2,13 +2,15 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=BuildSupport/simulator_guard.sh
+source "$ROOT/BuildSupport/simulator_guard.sh"
+devicehub_enter_simulator_lease device-hub-test-app 1800 "$0" "$@"
+
 PROCESS_GUARD="$ROOT/BuildSupport/process_guard.sh"
 # shellcheck source=BuildSupport/process_guard.sh
 source "$PROCESS_GUARD"
 devicehub_require_guard test-app 1800 "$0" "$@"
 
-# shellcheck source=BuildSupport/simulator_guard.sh
-source "$ROOT/BuildSupport/simulator_guard.sh"
 devicehub_require_simulator device-hub-test-app 1800 "$0" "$@"
 
 RUN_ROOT="$(mktemp -d "${TMPDIR:-/private/tmp}/device-hub-app-tests.XXXXXX")"
@@ -28,13 +30,11 @@ cleanup() {
   if ! devicehub_cleanup_simulator; then
     status=125
   fi
-  return "$status"
+  exit "$status"
 }
 trap cleanup EXIT
 
 cd "$ROOT"
-Sources/DeviceHubPrivateMedia/Tests/run-tests.sh
-
 DESTINATION="platform=iOS Simulator,id=$SIMULATOR_UDID" \
 DERIVED_DATA_PATH="$DERIVED_DATA_PATH" \
   Scripts/test-live-ios.sh
@@ -57,6 +57,7 @@ run_ui_snapshot_tests() {
         -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
         -derivedDataPath "$SNAPSHOT_DERIVED_DATA_PATH" \
         -only-testing:DeviceHubUITests/DeviceHubVisualSnapshotTests \
+        -only-testing:DeviceHubUITests/DeviceKeyboardReceiverTests \
         -parallel-testing-enabled NO \
         -collect-test-diagnostics never \
         -skipMacroValidation \

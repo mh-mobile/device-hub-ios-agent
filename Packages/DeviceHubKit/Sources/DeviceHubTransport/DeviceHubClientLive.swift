@@ -71,8 +71,10 @@ public struct DeviceHubTransportConfiguration: Equatable, Sendable {
             !trimmedValue.isEmpty,
             value == trimmedValue,
             value.utf8.count <= maximumUTF8Length,
+            // Only C0/C1 controls (Cc), as in Rust: format characters
+            // such as the ZWJ in emoji names are valid display text.
             value.unicodeScalars.allSatisfy({
-                !CharacterSet.controlCharacters.contains($0)
+                $0.properties.generalCategory != .control
             })
         else {
             throw NativeSessionContractError.invalidText
@@ -163,9 +165,9 @@ func verifyRemotePairingCandidate(
     service: ValidatedRemotePairingService,
     nativeSessions: NativeSessionClient,
     pairingPersistence: PairingPersistenceClient
-) async -> Bool {
+) async -> CandidateVerificationOutcome {
     guard !Task.isCancelled else {
-        return false
+        return .rejected
     }
 
     var hintMatched = false
@@ -174,7 +176,7 @@ func verifyRemotePairingCandidate(
         guard let record = records.first(where: {
             $0.deviceID == deviceID
         }) else {
-            return false
+            return .rejected
         }
         let expectedTag = RemotePairingAuthTag.compute(
             alternateIRK: record.peerAlternateIRK.withUnsafeBytes { Data($0) },
@@ -182,7 +184,7 @@ func verifyRemotePairingCandidate(
         )
         hintMatched = service.authTags.contains(expectedTag)
         guard hintMatched else {
-            return false
+            return .rejected
         }
         let request = try await NativeRemoteSessionRequest(
             generation: SessionGeneration(rawValue: UUID()),
@@ -194,12 +196,12 @@ func verifyRemotePairingCandidate(
         )
         try await nativeSessions.verifyRemotePairing(request)
         guard !Task.isCancelled else {
-            return false
+            return .rejected
         }
         if case .provisionalAfterVerifiedM5 = record.completion {
             _ = try await pairingPersistence.commitM6(deviceID, Date())
         }
-        return !Task.isCancelled
+        return Task.isCancelled ? .rejected : .verified
     } catch {
         if let failure = error as? NativeSessionFailure {
             candidateVerificationLogger.error(
@@ -210,8 +212,12 @@ func verifyRemotePairingCandidate(
                 authTagHintMatched=\(hintMatched, privacy: .public)
                 """
             )
+            // A transport failure says nothing about identity; verify again.
+            if failure.retryable {
+                return .unreachable
+            }
         }
-        return false
+        return .rejected
     }
 }
 
@@ -285,7 +291,6 @@ struct RemotePairingBonjourClient: Sendable {
             String
         ) async -> AsyncThrowingStream<PairingAdvertisementEvent, Error>
     var releaseDevice: @Sendable (DeviceID) async -> Void
-    var stopAvailability: @Sendable () async -> Void
     var stopPairingAdvertisement: @Sendable () async -> Void
     var refreshKnownDevices:
         @Sendable () async throws(RemotePairingBonjourError) -> Void
@@ -311,9 +316,6 @@ private extension RemotePairingBonjourTransport {
             },
             releaseDevice: { deviceID in
                 await self.releaseDevice(deviceID)
-            },
-            stopAvailability: {
-                await self.stopAvailability()
             },
             stopPairingAdvertisement: {
                 await self.stopPairingAdvertisement()
@@ -371,11 +373,11 @@ private actor DeviceHubTransportRuntime {
         let task = Task {
             await self.runAvailability(continuation: stream.continuation)
         }
+        // Cancelling the task ends its iteration of the transport stream,
+        // which stops exactly that browse generation by its own token. An
+        // untokened stop here could end a newer generation already running.
         stream.continuation.onTermination = { _ in
             task.cancel()
-            Task {
-                await self.environment.bonjour.stopAvailability()
-            }
         }
         return stream.stream
     }

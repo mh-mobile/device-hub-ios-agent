@@ -62,7 +62,6 @@ public enum MediaSystemStatus: Equatable, Sendable {
 public enum MediaDecoderError: Error, Equatable, Sendable {
     case decoderStopped
     case decodedDimensionsMismatch
-    case outputFrameDropped
     case outputFrameMissing
     case invalidParameterSet(HEVCParameterSetKind, MediaInputViolation)
     case invalidSample(HEVCSampleViolation)

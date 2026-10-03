@@ -116,18 +116,22 @@ public enum DeviceHubError: Error, CaseIterable, Codable, Hashable, Sendable {
         }
     }
 
+    /// `.automatic` errors are retried by the app on its own, so only the
+    /// transient ones belong there. A failed secure handshake or a decoder
+    /// that rejects the stream fails the same way on every attempt, so those
+    /// wait for the user instead of reconnecting in a loop.
     public var retryability: Retryability {
         switch self {
         case .deviceOffline,
              .connectionLost,
-             .secureConnectionFailed,
-             .mediaStalled,
-             .decoderFailed:
+             .mediaStalled:
             .automatic
 
         case .pairingTimedOut,
              .pairingRejected,
-             .incorrectPairingCode:
+             .incorrectPairingCode,
+             .secureConnectionFailed,
+             .decoderFailed:
             .userInitiated
 
         case .localNetworkDenied,
@@ -282,7 +286,7 @@ public enum DeviceHubError: Error, CaseIterable, Codable, Hashable, Sendable {
         case .decoderFailed:
             UserFacingCopy(
                 title: "Screen Couldn’t Be Displayed",
-                message: "Device Hub is restarting the live view."
+                message: "Reconnect to show the screen again."
             )
         }
     }

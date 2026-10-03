@@ -27,6 +27,7 @@ extension RemoteSessionFeature {
 
             state.selectedDeviceID = deviceID
             state.isViewingStopped = false
+            state.reconnectAttempts = 0
             state.pairing = nil
             return beginSessionIfPossible(
                 state: &state,
@@ -46,10 +47,48 @@ extension RemoteSessionFeature {
                 return .none
             }
 
+        case let .reconnectTimerFired(attemptID):
+            guard state.lifecycle != .inactive else {
+                // A notification or Slide Over made the app briefly
+                // inactive; try again later instead of dropping the retry.
+                guard let session = state.session,
+                      session.attemptID == attemptID
+                else {
+                    return .none
+                }
+                return reconnectEffect(
+                    attemptID: attemptID,
+                    after: session.connectionError,
+                    state: state
+                )
+            }
+            guard state.lifecycle == .active,
+                  !state.isViewingStopped,
+                  let session = state.session,
+                  session.attemptID == attemptID,
+                  session.sessionID == nil,
+                  session.connectionError != nil,
+                  let device = state.selectedDevice,
+                  device.id == session.device.id
+            else {
+                return .none
+            }
+            let begin = beginSessionIfPossible(
+                state: &state,
+                device: device
+            )
+            // Only a reconnect that actually starts connecting counts; an
+            // unreachable device is picked up again by its next snapshot.
+            if state.session != nil {
+                state.reconnectAttempts += 1
+            }
+            return begin
+
         case .retrySelectedDevice:
             guard let device = state.selectedDevice else {
                 return .none
             }
+            state.reconnectAttempts = 0
             return beginSessionIfPossible(
                 state: &state,
                 device: device
@@ -60,6 +99,7 @@ extension RemoteSessionFeature {
                 return .none
             }
             state.isViewingStopped = false
+            state.reconnectAttempts = 0
             return beginSessionIfPossible(
                 state: &state,
                 device: device
@@ -77,8 +117,8 @@ extension RemoteSessionFeature {
                 return cancelSessionEffects()
             }
             return .concatenate(
-                closeSessionEffect(session: previousSession),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                closeSessionEffect(session: previousSession)
             )
 
         default:
@@ -104,8 +144,8 @@ extension RemoteSessionFeature {
                 return cancelSessionEffects()
             }
             return .concatenate(
-                closeSessionEffect(session: previousSession),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                closeSessionEffect(session: previousSession)
             )
         }
 
@@ -127,8 +167,8 @@ extension RemoteSessionFeature {
             )
         }
         return .concatenate(
-            closeSessionEffect(session: previousSession),
             cancelSessionEffects(),
+            closeSessionEffect(session: previousSession),
             connect
         )
     }
@@ -144,6 +184,7 @@ extension RemoteSessionFeature {
         )
         if state.selectedDeviceID != previousSelection {
             state.isViewingStopped = false
+            state.reconnectAttempts = 0
         }
 
         let deviceUpdate = updateActiveDevice(state: &state)
@@ -160,8 +201,8 @@ extension RemoteSessionFeature {
                     return cancelSessionEffects()
                 }
                 return .concatenate(
-                    closeSessionEffect(session: previousSession),
-                    cancelSessionEffects()
+                    cancelSessionEffects(),
+                    closeSessionEffect(session: previousSession)
                 )
             }
             return deviceUpdate
@@ -199,13 +240,15 @@ extension RemoteSessionFeature {
         }
         state.session = session
         if device.pairingState != .paired {
+            let ending = session
             session.connectionError = .needsPairing
+            session.sessionID = nil
             state.session = session
             state.remediation = DeviceHubRemediation(error: .needsPairing)
             state.activeContactIDs.removeAll()
             return .concatenate(
-                closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                closeSessionEffect(session: ending)
             )
         }
         guard wasAcceptingInput, !session.acceptsInput else {

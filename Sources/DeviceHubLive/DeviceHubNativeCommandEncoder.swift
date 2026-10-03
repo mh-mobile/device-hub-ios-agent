@@ -263,14 +263,7 @@ enum DeviceHubNativeCommandEncoder {
 
         let maximumX = Double(pixelSize.width - 1)
         let maximumY = Double(pixelSize.height - 1)
-        guard
-            point.x.isFinite,
-            point.y.isFinite,
-            point.x >= 0,
-            point.y >= 0,
-            point.x <= maximumX,
-            point.y <= maximumY
-        else {
+        guard point.isAddressable(in: pixelSize) else {
             throw .invalidCoordinate
         }
 

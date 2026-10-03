@@ -310,10 +310,10 @@ func makeTransport(
     @escaping @Sendable (
         DeviceID,
         ValidatedRemotePairingService
-    ) async -> Bool = { _, service in
+    ) async -> CandidateVerificationOutcome = { _, service in
         service.authTags.contains {
             $0.base64EncodedString() == "kXjlTr2l"
-        }
+        } ? .verified : .rejected
     },
     loadKnownDevices:
     @escaping @Sendable () async throws -> [KnownRemotePairingDevice] = {
@@ -340,6 +340,7 @@ func makeTransport(
         browser: browser.client,
         publisher: publisher.client,
         verifyCandidate: verifyCandidate,
+        candidateRetryDelay: .milliseconds(10),
         observe: observe ?? observations.record,
         reportDiagnosticsFailure: reportDiagnosticsFailure
     )

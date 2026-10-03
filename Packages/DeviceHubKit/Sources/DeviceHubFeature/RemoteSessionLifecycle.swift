@@ -17,8 +17,19 @@ extension RemoteSessionFeature {
 
             switch lifecycle {
             case .active:
-                guard previousLifecycle == .background else {
+                // iOS returns from background through inactive, so the
+                // previous phase alone cannot tell whether work stopped;
+                // backgrounding always ends availability observation.
+                guard previousLifecycle != .active,
+                      !state.isObservingAvailability
+                else {
                     return .none
+                }
+                // With a session the roster is current; reloading it would
+                // mark the live device unreachable until the next snapshot.
+                guard state.session == nil else {
+                    state.isObservingAvailability = true
+                    return observeAvailabilityEffect()
                 }
                 return .send(.task)
 
@@ -32,9 +43,20 @@ extension RemoteSessionFeature {
                 guard let previousSession else {
                     return cancelAllEffects()
                 }
+                // Releasing input and stopping media must reach the device
+                // before iOS suspends the process.
+                let sessionCoordinator = sessionCoordinator
                 return .concatenate(
-                    closeSessionEffect(session: previousSession),
-                    cancelAllEffects()
+                    cancelAllEffects(),
+                    .run { [backgroundExecution] _ in
+                        await backgroundExecution.protect(
+                            "close-remote-session"
+                        ) {
+                            _ = await sessionCoordinator.close(
+                                attemptID: previousSession.attemptID
+                            )
+                        }
+                    }
                 )
 
             case .inactive:
@@ -49,7 +71,25 @@ extension RemoteSessionFeature {
 
         case .availabilityObservationFinished:
             state.isObservingAvailability = false
-            return .none
+            guard state.lifecycle == .active else {
+                return .none
+            }
+            return .run { [clock] send in
+                try await clock.sleep(for: Self.recoveryDelay)
+                await send(.availabilityRestartDue)
+            }
+            .cancellable(id: CancelID.availabilityRestart, cancelInFlight: true)
+
+        case .availabilityRestartDue:
+            // Only observation restarts: reloading the roster would replace
+            // live devices with unreachable records until the next snapshot.
+            guard state.lifecycle == .active,
+                  !state.isObservingAvailability
+            else {
+                return .none
+            }
+            state.isObservingAvailability = true
+            return observeAvailabilityEffect()
 
         case .task:
             guard state.lifecycle == .active else {
@@ -93,6 +133,7 @@ extension RemoteSessionFeature {
         .merge(
             cancelSessionEffects(),
             .cancel(id: CancelID.availability),
+            .cancel(id: CancelID.availabilityRestart),
             .cancel(id: CancelID.rosterLoad)
         )
     }

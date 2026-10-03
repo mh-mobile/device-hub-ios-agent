@@ -479,12 +479,7 @@ private extension RemoteSessionOperation {
         guard
             didEmitHIDReadiness,
             let displayGeometry,
-            point.x.isFinite,
-            point.y.isFinite,
-            point.x >= 0,
-            point.y >= 0,
-            point.x < Double(displayGeometry.pixelSize.width),
-            point.y < Double(displayGeometry.pixelSize.height)
+            point.isAddressable(in: displayGeometry.pixelSize)
         else {
             throw DeviceHubError.deviceBusy
         }

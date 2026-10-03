@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import subprocess
@@ -13,6 +14,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bootstrap_idevice
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class IDeviceBootstrapTests(unittest.TestCase):
@@ -219,18 +222,42 @@ class IDeviceBootstrapTests(unittest.TestCase):
         )
         self.assertEqual(self._temporary_bootstrap_paths(), [])
 
-    def test_existing_lock_fails_before_writing(self) -> None:
+    def test_held_lock_fails_before_writing(self) -> None:
         self.destination.parent.mkdir(parents=True)
         lock = self.destination.parent / ".idevice-bootstrap.lock"
-        lock.write_text("other process\n")
-
-        with self.assertRaisesRegex(
-            bootstrap_idevice.BootstrapError,
-            "already running",
-        ):
-            bootstrap_idevice.bootstrap(self.specification)
+        with lock.open("w") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(
+                bootstrap_idevice.BootstrapError,
+                "already running",
+            ):
+                bootstrap_idevice.bootstrap(self.specification)
 
         self.assertFalse(self.destination.exists())
+
+    def test_lock_and_staging_left_by_a_killed_bootstrap_do_not_block(self) -> None:
+        vendor = self.destination.parent
+        vendor.mkdir(parents=True)
+        (vendor / ".idevice-bootstrap.lock").write_text("12345\n")
+        stale = vendor / ".idevice-bootstrap-killed"
+        (stale / ".git").mkdir(parents=True)
+
+        self.assertTrue(bootstrap_idevice.bootstrap(self.specification))
+        self.assertFalse(stale.exists())
+
+    def test_bootstrap_scratch_paths_are_ignored_by_git(self) -> None:
+        for name in (
+            ".idevice-bootstrap.lock",
+            ".idevice-bootstrap-abc/file",
+            ".idevice-previous-abc/file",
+        ):
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    ("git", "check-ignore", "-q", f"Vendor/{name}"),
+                    cwd=ROOT,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
 
     def _temporary_bootstrap_paths(self) -> list[Path]:
         vendor = self.destination.parent

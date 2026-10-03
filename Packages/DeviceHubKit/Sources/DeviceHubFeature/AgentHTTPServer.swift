@@ -10,74 +10,204 @@ import Network
 ///     POST /type     {"text":"…"}
 ///     POST /button   {"name":"home|lock|mute|siri|volumeUp|volumeDown"}
 ///
-/// ponytail: no auth, one request per connection. Reach it only over a network you
-/// trust (e.g. a tailnet); add a token before using it anywhere else.
+/// Every request is checked by `AgentAccessPolicy` (loopback or tailnet source
+/// plus a bearer token); the server does not start without a token. One
+/// request per connection.
 public final class AgentHTTPServer: @unchecked Sendable {
     public static let shared = AgentHTTPServer()
+
+    /// A connection that has not delivered a full request by then is closed.
+    static let requestTimeout: DispatchTimeInterval = .seconds(10)
+    static let restartDelay: DispatchTimeInterval = .seconds(2)
+    /// Connections served at once; more are refused until one closes.
+    static let maximumConnections = 8
+
     private var listener: NWListener?
+    /// Touched only on `queue`.
+    private var openConnections = 0
     private let queue = DispatchQueue(label: "agent.http")
 
-    public func start(port: UInt16 = 8765) {
-        guard listener == nil, let nwPort = NWEndpoint.Port(rawValue: port),
-              let listener = try? NWListener(using: .tcp, on: nwPort) else { return }
-        listener.newConnectionHandler = { [weak self] connection in self?.serve(connection) }
+    /// Starts listening when `policy` is non-nil; a failed listener restarts itself.
+    public func start(policy: AgentAccessPolicy?, port: UInt16 = 8765) {
+        guard let policy else {
+            return
+        }
+        queue.async { self.listen(policy: policy, port: port) }
+    }
+
+    private func listen(policy: AgentAccessPolicy, port: UInt16) {
+        guard listener == nil,
+              let nwPort = NWEndpoint.Port(rawValue: port),
+              let listener = try? NWListener(using: .tcp, on: nwPort)
+        else {
+            return
+        }
+        listener.newConnectionHandler = { [weak self] connection in
+            // Untrusted sources and excess connections are dropped before
+            // anything is read, so they cannot hold buffers or the queue.
+            guard let self,
+                  AgentAccessPolicy.isTrustedSource(Self.sourceAddress(of: connection)),
+                  openConnections < Self.maximumConnections
+            else {
+                connection.cancel()
+                return
+            }
+            serve(connection, policy: policy)
+        }
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, case .failed = state else {
+                return
+            }
+            listener?.cancel()
+            self.listener = nil
+            queue.asyncAfter(deadline: .now() + Self.restartDelay) {
+                self.listen(policy: policy, port: port)
+            }
+        }
         listener.start(queue: queue)
         self.listener = listener
     }
 
-    private func serve(_ connection: NWConnection) {
+    private func serve(_ connection: NWConnection, policy: AgentAccessPolicy) {
+        openConnections += 1
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed:
+                connection.cancel()
+            case .cancelled:
+                self?.openConnections -= 1
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
-        receive(connection, buffer: Data())
+        let request = PendingRequest()
+        // Bounds only how long a client may take to send its request; a
+        // request that is being handled (a drag can last ten seconds) is not
+        // cut off, which would make a client resend an applied command.
+        queue.asyncAfter(deadline: .now() + Self.requestTimeout) {
+            if !request.isComplete {
+                connection.cancel()
+            }
+        }
+        receive(connection, buffer: Data(), policy: policy, request: request)
     }
 
-    private func receive(_ connection: NWConnection, buffer: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, error in
-            guard let self else { return }
+    private func receive(
+        _ connection: NWConnection,
+        buffer: Data,
+        policy: AgentAccessPolicy,
+        request pending: PendingRequest
+    ) {
+        connection.receive(
+            minimumIncompleteLength: 1,
+            maximumLength: 65536
+        ) { [weak self] data, _, done, error in
+            guard let self else {
+                return
+            }
             var buffer = buffer
-            if let data { buffer.append(data) }
-            if let request = Request(buffer) {
-                Task { await self.respond(to: request, on: connection) }
-            } else if done || error != nil || buffer.count > 1_000_000 {
-                connection.cancel()
-            } else {
-                self.receive(connection, buffer: buffer)
+            if let data {
+                buffer.append(data)
+            }
+            switch AgentHTTPRequest.parse(buffer) {
+            case let .complete(request):
+                pending.isComplete = true
+                let decision = policy.decide(
+                    sourceAddress: Self.sourceAddress(of: connection),
+                    authorization: request.header("authorization")
+                )
+                switch decision {
+                case .allowed:
+                    Task { await self.respond(to: request, on: connection) }
+                case .forbiddenSource:
+                    send(connection, status: "403 Forbidden", json: ["error": "forbidden source"])
+                case .unauthorized:
+                    send(connection, status: "401 Unauthorized", json: ["error": "missing or wrong token"])
+                }
+            case .malformed:
+                send(connection, status: "400 Bad Request", json: ["error": "malformed request"])
+            case .incomplete:
+                if done || error != nil {
+                    connection.cancel()
+                } else {
+                    receive(connection, buffer: buffer, policy: policy, request: pending)
+                }
             }
         }
     }
 
-    private func respond(to request: Request, on connection: NWConnection) async {
+    private static func sourceAddress(of connection: NWConnection) -> [UInt8] {
+        guard case let .hostPort(host, _) = connection.endpoint else {
+            return []
+        }
+        switch host {
+        case let .ipv4(address):
+            return Array(address.rawValue)
+        case let .ipv6(address):
+            return Array(address.rawValue)
+        default:
+            return []
+        }
+    }
+
+    private func respond(to request: AgentHTTPRequest, on connection: NWConnection) async {
         let bridge = AgentBridge.shared
-        let body = request.json
-        func number(_ key: String) -> Double? { (body[key] as? NSNumber)?.doubleValue }
         do {
             switch (request.method, request.path) {
             case ("GET", "/screen"):
                 let size = try bridge.screenSize()
                 send(connection, json: ["width": size.width, "height": size.height])
             case ("GET", "/screenshot"):
-                send(connection, status: "200 OK", type: "image/png", body: try bridge.screenshotPNG())
+                let png = try bridge.screenshotPNG()
+                send(connection, status: "200 OK", type: "image/png", body: png)
             case ("POST", "/tap"):
-                guard let x = number("x"), let y = number("y") else { throw AgentBridgeError("tap needs x and y") }
+                guard let x = request.number("x"), let y = request.number("y") else {
+                    throw AgentBridgeError("tap needs finite x and y")
+                }
                 try await bridge.tap(x: x, y: y)
                 send(connection, json: ["ok": true])
             case ("POST", "/drag"):
-                guard let x1 = number("x1"), let y1 = number("y1"), let x2 = number("x2"), let y2 = number("y2")
-                else { throw AgentBridgeError("drag needs x1, y1, x2, y2") }
-                try await bridge.drag(from: (x1, y1), to: (x2, y2), duration: number("duration") ?? 0.3)
+                guard let x1 = request.number("x1"), let y1 = request.number("y1"),
+                      let x2 = request.number("x2"), let y2 = request.number("y2")
+                else {
+                    throw AgentBridgeError("drag needs finite x1, y1, x2, y2")
+                }
+                try await bridge.drag(
+                    from: (x1, y1),
+                    to: (x2, y2),
+                    duration: request.number("duration") ?? 0.3
+                )
                 send(connection, json: ["ok": true])
             case ("POST", "/type"):
-                guard let text = body["text"] as? String else { throw AgentBridgeError("type needs text") }
+                guard let text = request.string("text") else {
+                    throw AgentBridgeError("type needs text")
+                }
                 try await bridge.type(text)
                 send(connection, json: ["ok": true])
             case ("POST", "/button"):
-                guard let name = body["name"] as? String else { throw AgentBridgeError("button needs name") }
+                guard let name = request.string("name") else {
+                    throw AgentBridgeError("button needs name")
+                }
                 try await bridge.press(name)
                 send(connection, json: ["ok": true])
             default:
-                send(connection, status: "404 Not Found", json: ["error": "no route \(request.method) \(request.path)"])
+                send(
+                    connection,
+                    status: "404 Not Found",
+                    json: ["error": "no route \(request.method) \(request.path)"]
+                )
             }
+        } catch let error as AgentBridgeError {
+            send(connection, status: "400 Bad Request", json: ["error": error.description])
+        } catch let error as AgentBridge.Failure {
+            send(connection, status: "409 Conflict", json: ["error": error.description])
         } catch {
-            send(connection, status: "409 Conflict", json: ["error": String(describing: error)])
+            send(
+                connection,
+                status: "500 Internal Server Error",
+                json: ["error": String(describing: error)]
+            )
         }
     }
 
@@ -87,33 +217,95 @@ public final class AgentHTTPServer: @unchecked Sendable {
     }
 
     private func send(_ connection: NWConnection, status: String, type: String, body: Data) {
-        var out = Data("HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n".utf8)
+        var out = Data(
+            ("HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\n"
+                + "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n").utf8
+        )
         out.append(body)
         connection.send(content: out, completion: .contentProcessed { _ in connection.cancel() })
     }
 }
 
+/// Whether a connection has delivered its whole request. Touched only on the
+/// server's serial queue.
+private final class PendingRequest: @unchecked Sendable {
+    var isComplete = false
+}
+
 /// One complete request: the head and, when Content-Length says so, its body.
-private struct Request {
+struct AgentHTTPRequest: Equatable {
+    static let maximumHeadBytes = 16 * 1024
+    static let maximumBodyBytes = 64 * 1024
+
+    enum ParseResult: Equatable {
+        case complete(AgentHTTPRequest)
+        case incomplete
+        case malformed
+    }
+
     let method: String
     let path: String
-    let json: [String: Any]
+    private let headers: [String: String]
+    private let body: Data
 
-    init?(_ data: Data) {
-        guard let end = data.range(of: Data("\r\n\r\n".utf8)),
-              let head = String(data: data[..<end.lowerBound], encoding: .utf8) else { return nil }
+    static func parse(_ data: Data) -> ParseResult {
+        guard let end = data.range(of: Data("\r\n\r\n".utf8)) else {
+            return data.count > maximumHeadBytes ? .malformed : .incomplete
+        }
+        guard end.lowerBound - data.startIndex <= maximumHeadBytes,
+              let head = String(data: data[..<end.lowerBound], encoding: .utf8)
+        else {
+            return .malformed
+        }
         let lines = head.components(separatedBy: "\r\n")
-        let first = lines[0].split(separator: " ")
-        guard first.count >= 2 else { return nil }
-        let length = lines.dropFirst().compactMap { line -> Int? in
-            let parts = line.split(separator: ":", maxSplits: 1)
-            guard parts.count == 2, parts[0].lowercased() == "content-length" else { return nil }
-            return Int(parts[1].trimmingCharacters(in: .whitespaces))
-        }.first ?? 0
+        let requestLine = lines[0].split(separator: " ")
+        guard requestLine.count == 3, requestLine[2].hasPrefix("HTTP/1.") else {
+            return .malformed
+        }
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else {
+                return .malformed
+            }
+            headers[line[..<colon].lowercased()] = line[line.index(after: colon)...]
+                .trimmingCharacters(in: .whitespaces)
+        }
+        var length = 0
+        if let declared = headers["content-length"] {
+            guard let value = Int(declared), (0 ... maximumBodyBytes).contains(value) else {
+                return .malformed
+            }
+            length = value
+        }
         let body = data[end.upperBound...]
-        guard body.count >= length else { return nil }
-        method = String(first[0])
-        path = String(first[1].split(separator: "?").first ?? "")
-        json = length > 0 ? ((try? JSONSerialization.jsonObject(with: body.prefix(length))) as? [String: Any] ?? [:]) : [:]
+        guard body.count >= length else {
+            return .incomplete
+        }
+        return .complete(AgentHTTPRequest(
+            method: String(requestLine[0]),
+            path: String(requestLine[1].split(separator: "?").first ?? ""),
+            headers: headers,
+            body: Data(body.prefix(length))
+        ))
+    }
+
+    func header(_ name: String) -> String? {
+        headers[name.lowercased()]
+    }
+
+    /// A JSON number field, or `nil`. JSON cannot encode non-finite numbers.
+    func number(_ key: String) -> Double? {
+        (json[key] as? NSNumber)?.doubleValue
+    }
+
+    func string(_ key: String) -> String? {
+        json[key] as? String
+    }
+
+    private var json: [String: Any] {
+        guard !body.isEmpty else {
+            return [:]
+        }
+        return (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
     }
 }

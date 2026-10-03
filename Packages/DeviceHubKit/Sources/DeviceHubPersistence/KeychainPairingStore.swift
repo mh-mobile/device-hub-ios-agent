@@ -149,7 +149,7 @@ public actor KeychainPairingStore {
             return record
 
         case let .provisionalAfterVerifiedM5(verifiedAt):
-            try DateValidationForStore.requireValidCommit(
+            let committedAt = try DateValidationForStore.commitDate(
                 verifiedAt: verifiedAt,
                 committedAt: committedAt
             )
@@ -433,16 +433,17 @@ private func traceKeychainReadFailure(_ error: KeychainDriverError) {
 }
 
 private enum DateValidationForStore {
-    static func requireValidCommit(
+    /// The commit time to record. A wall clock that moved backwards since M5
+    /// is clamped to `verifiedAt` instead of failing the commit, which would
+    /// leave the record provisional and the device unusable.
+    static func commitDate(
         verifiedAt: Date,
         committedAt: Date
-    ) throws {
+    ) throws -> Date {
         guard committedAt.timeIntervalSinceReferenceDate.isFinite else {
             throw PairingPersistenceError.invalidDate(.committedAt)
         }
-        guard committedAt >= verifiedAt else {
-            throw PairingPersistenceError.invalidCompletionState
-        }
+        return max(committedAt, verifiedAt)
     }
 }
 

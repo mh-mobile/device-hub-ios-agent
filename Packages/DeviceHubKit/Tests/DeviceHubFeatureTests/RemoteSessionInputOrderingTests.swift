@@ -10,15 +10,6 @@ import Testing
 @MainActor
 @Suite("Remote session input ordering")
 struct RemoteSessionInputOrderingTests {
-    @Test("Touch trace milestones never contain screen coordinates")
-    func touchTraceMilestonesAreCoordinateFree() {
-        let message = DeviceHubFeatureTrace.Milestone.touchTap.message
-
-        #expect(message == "input_geometry kind=touch_tap")
-        #expect(!message.contains("123.456"))
-        #expect(!message.contains("789.012"))
-    }
-
     @Test("Semantic taps remain one command while transport is suspended")
     func semanticTapsRemainAtomicWhenTransportIsSuspended() async throws {
         let fixture = AtomicInputFixture()
@@ -103,6 +94,58 @@ struct RemoteSessionInputOrderingTests {
                 .releaseAllInput
             ]
         )
+    }
+
+    @Test("Moves queued behind a busy transport collapse to the latest")
+    func queuedMovesCollapse() async throws {
+        let fixture = AtomicInputFixture()
+        let recorder = SuspendingCommandRecorder()
+        let store = try await fixture.readyStore(recorder: recorder)
+        store.exhaustivity = .off
+        let viewport = Viewport(
+            origin: Point2D(x: 0, y: 0),
+            size: Size2D(width: 2, height: 2)
+        )
+        func touch(_ phase: TouchPhase, _ x: Double) -> RemoteSessionFeature.Action {
+            .touch(contactID: 7, phase: phase, point: Point2D(x: x, y: x), viewport: viewport)
+        }
+
+        await store.send(touch(.began, 0))
+        await recorder.waitForCommandCount(1)
+        for x in [0.4, 0.8, 1.2] {
+            await store.send(touch(.moved, x))
+        }
+        await store.send(touch(.ended, 1.6))
+        await recorder.resumeFirst()
+        await recorder.waitForCommandCount(3)
+        await store.skipReceivedActions()
+
+        let phases = await recorder.snapshot().compactMap { command -> TouchPhase? in
+            guard case let .touch(touch) = command else {
+                return nil
+            }
+            return touch.phase
+        }
+        expectNoDifference(phases, [.began, .moved, .ended])
+        let moved = await recorder.snapshot().compactMap { command -> TargetPixelPoint? in
+            guard case let .touch(touch) = command, touch.phase == .moved else {
+                return nil
+            }
+            return touch.point
+        }
+        let latest = try #require(store.state.session?.frame?.metadata)
+        expectNoDifference(
+            moved,
+            [
+                RemoteCoordinateMapper.map(
+                    Point2D(x: 1.2, y: 1.2),
+                    in: viewport,
+                    targetPixels: latest.pixelSize,
+                    orientation: latest.orientation
+                )?.point
+            ].compactMap(\.self)
+        )
+        await store.skipInFlightEffects()
     }
 
     @Test("Touch edges wait for the preceding edge to finish")

@@ -28,15 +28,27 @@ extension RemoteSessionFeature {
             if case .ended = session.remoteState?.connection {
                 return .none
             }
+            // Close the original session ID: a cleanup failure for it no
+            // longer matches the ended state, so it cannot replace the error
+            // that ended the session.
+            let ending = session
             session.connectionError = .connectionLost
+            session.sessionID = nil
             state.activeContactIDs.removeAll()
             state.remediation = DeviceHubRemediation(
                 error: .connectionLost
             )
             state.session = session
             return .concatenate(
-                closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                .merge(
+                    closeSessionEffect(session: ending),
+                    reconnectEffect(
+                        attemptID: attemptID,
+                        after: .connectionLost,
+                        state: state
+                    )
+                )
             )
 
         case let .sessionStreamFailed(attemptID, sessionID, error):
@@ -49,13 +61,18 @@ extension RemoteSessionFeature {
             DeviceHubFeatureTrace.emit(
                 "session_stream_failed error=\(String(describing: error))"
             )
+            let ending = session
             session.connectionError = error
+            session.sessionID = nil
             state.activeContactIDs.removeAll()
             state.remediation = DeviceHubRemediation(error: error)
             state.session = session
             return .concatenate(
-                closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                .merge(
+                    closeSessionEffect(session: ending),
+                    reconnectEffect(attemptID: attemptID, after: error, state: state)
+                )
             )
 
         case let .sessionUpdateReceived(attemptID, sessionID, update):
@@ -111,7 +128,7 @@ extension RemoteSessionFeature {
             session.sessionID = nil
             state.remediation = DeviceHubRemediation(error: error)
             state.session = session
-            return .none
+            return reconnectEffect(attemptID: attemptID, after: error, state: state)
 
         case let .success(openedSession):
             DeviceHubFeatureTrace.emit("connection_opened")
@@ -161,10 +178,18 @@ extension RemoteSessionFeature {
         state.session = session
 
         if update.event.endsSession {
+            state.session?.sessionID = nil
             state.activeContactIDs.removeAll()
             return .concatenate(
-                closeSessionEffect(session: session),
-                cancelSessionEffects()
+                cancelSessionEffects(),
+                .merge(
+                    closeSessionEffect(session: session),
+                    reconnectEffect(
+                        attemptID: session.attemptID,
+                        after: session.connectionError,
+                        state: state
+                    )
+                )
             )
         }
         guard wasAcceptingInput, !session.acceptsInput else {

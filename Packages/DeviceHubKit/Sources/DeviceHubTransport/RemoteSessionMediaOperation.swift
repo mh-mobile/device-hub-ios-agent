@@ -38,8 +38,8 @@ extension RemoteSessionOperation {
                 case .discontinuity:
                     try await resetDecoder()
 
-                case .failed:
-                    throw DeviceHubError.decoderFailed
+                case let .failed(failure):
+                    throw failure.reason.deviceHubError
 
                 case .finished:
                     return
@@ -117,8 +117,6 @@ func mediaDiagnosticStage(
         .displayStopped
     case .decodedDimensionsMismatch:
         .firstVisual
-    case .outputFrameDropped:
-        .displayStalled
     case .invalidParameterSet:
         .startingDisplay
     case .invalidSample, .staleGeneration:

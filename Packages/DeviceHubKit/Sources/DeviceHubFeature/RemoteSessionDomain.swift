@@ -30,6 +30,8 @@ public extension RemoteSessionFeature {
         public var remediation: DeviceHubRemediation?
         /// Canonical sorted roster of known paired devices.
         public var roster: DeviceRoster
+        /// Automatic reconnects since the last live frame or user retry.
+        public var reconnectAttempts: Int
         /// Stable selection retained across temporary availability loss.
         public var selectedDeviceID: DeviceID?
         /// Ephemeral state for the one connection attempt owned by the feature.
@@ -45,6 +47,7 @@ public extension RemoteSessionFeature {
             lifecycle: DeviceHubAppLifecycle = .active,
             pairing: PairingFeature.State? = nil,
             remediation: DeviceHubRemediation? = nil,
+            reconnectAttempts: Int = 0,
             roster: DeviceRoster = DeviceRoster(),
             selectedDeviceID: DeviceID? = nil,
             session: ActiveRemoteSession? = nil
@@ -58,6 +61,7 @@ public extension RemoteSessionFeature {
             self.lifecycle = lifecycle
             self.pairing = pairing
             self.remediation = remediation
+            self.reconnectAttempts = reconnectAttempts
             self.roster = roster
             self.selectedDeviceID = selectedDeviceID
             self.session = session
@@ -121,6 +125,7 @@ public extension RemoteSessionFeature {
     enum Action {
         case appLifecycleChanged(DeviceHubAppLifecycle)
         case availabilityObservationFinished
+        case availabilityRestartDue
         case availabilitySnapshotReceived([DeviceSummary])
         case buttonTapped(DeviceButton)
         case commandFailed(
@@ -165,6 +170,7 @@ public extension RemoteSessionFeature {
         case pairing(PresentationAction<PairingFeature.Action>)
         case remediationButtonTapped
         case remediationDismissed
+        case reconnectTimerFired(attemptID: UUID)
         case retrySelectedDevice
         case rotateRightButtonTapped
         case sessionEventsFinished(
@@ -183,7 +189,6 @@ public extension RemoteSessionFeature {
         )
         case startViewingButtonTapped
         case stopViewingButtonTapped
-        case tap(point: Point2D, viewport: Viewport)
         case task
         case touch(
             contactID: UInt8,

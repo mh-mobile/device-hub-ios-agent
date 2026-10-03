@@ -3,6 +3,17 @@ import DeviceHubDiagnostics
 import DeviceHubPersistence
 import Foundation
 
+/// What Pair Verify against an advertised candidate proved.
+enum CandidateVerificationOutcome: Equatable, Sendable {
+    /// The candidate is the paired device.
+    case verified
+    /// The candidate is not the paired device, or refused our pairing.
+    case rejected
+    /// The candidate could not be reached; it may be the device and is
+    /// verified again later instead of being written off.
+    case unreachable
+}
+
 /// Owns the cancellable system-Bonjour lifecycle for remote pairing.
 ///
 /// The actor treats resolved announcements as candidates and emits availability
@@ -17,7 +28,7 @@ public actor RemotePairingBonjourTransport {
         @Sendable (
             DeviceID,
             ValidatedRemotePairingService
-        ) async -> Bool
+        ) async -> CandidateVerificationOutcome
 
     struct BrowsingState {
         let continuation:
@@ -67,6 +78,8 @@ public actor RemotePairingBonjourTransport {
     let publisher: BonjourPublisherClient
     var publishingState: PublishingState?
     let verifyCandidate: CandidateVerifier
+    /// Wait before re-verifying a candidate that could not be reached.
+    let candidateRetryDelay: Duration
 
     init(
         loadKnownDevices:
@@ -77,9 +90,11 @@ public actor RemotePairingBonjourTransport {
         browser: BonjourBrowserClient,
         publisher: BonjourPublisherClient,
         verifyCandidate: @escaping CandidateVerifier,
+        candidateRetryDelay: Duration = .seconds(5),
         observe: @escaping DiagnosticSink,
         reportDiagnosticsFailure: @escaping @Sendable () -> Void = {}
     ) {
+        self.candidateRetryDelay = candidateRetryDelay
         self.browser = browser
         self.loadKnownDevices = loadKnownDevices
         self.loadPairableHostIdentity = loadPairableHostIdentity

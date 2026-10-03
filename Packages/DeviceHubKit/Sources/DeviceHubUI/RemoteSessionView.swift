@@ -42,6 +42,21 @@ struct RemoteSessionView: View {
         case .nativeToolbar:
             canvas(screenInset: chromeLayout.screenInset)
 
+        case .floatingTrailingRail where showsLandscapeTarget:
+            // A landscape target fills the width, leaving no pillarboxes for
+            // floating chrome; give the header and rail their own space so
+            // they never cover tappable remote pixels.
+            VStack(alignment: .leading, spacing: 6) {
+                floatingHeader
+                HStack(spacing: 8) {
+                    canvas(screenInset: 0)
+                    if store.selectedDevice != nil {
+                        controls()
+                    }
+                }
+            }
+            .padding(8)
+
         case .floatingTrailingRail:
             canvas(screenInset: chromeLayout.screenInset)
                 .overlay(alignment: .topLeading) {
@@ -74,6 +89,16 @@ struct RemoteSessionView: View {
         }
     }
 
+    /// Whether the remote picture is wider than tall in its displayed
+    /// orientation.
+    private var showsLandscapeTarget: Bool {
+        guard let metadata = store.session?.frame?.metadata else {
+            return false
+        }
+        let displayed = metadata.orientation.orientedSize(for: metadata.pixelSize)
+        return displayed.width > displayed.height
+    }
+
     private func canvas(screenInset: CGFloat) -> some View {
         ZStack {
             RemoteCanvas(
@@ -85,10 +110,10 @@ struct RemoteSessionView: View {
                 remediation: store.remediation,
                 screenInset: screenInset,
                 pairButtonTapped: pairButtonTapped,
+                reconnectButtonTapped: reconnectButtonTapped,
                 remediationButtonTapped: remediationButtonTapped,
                 remediationDismissed: remediationDismissed,
                 startViewingButtonTapped: startViewingButtonTapped,
-                tap: tap,
                 touch: touch
             )
             .id(store.selectedDeviceID)
@@ -164,11 +189,10 @@ struct RemoteSessionView: View {
                         nativeToolbar
                     }
                     .toolbar(.visible, for: .navigationBar)
-                    .toolbarBackground(
-                        RemoteCanvasColor.value,
-                        for: .navigationBar
-                    )
-                    .toolbarBackground(.visible, for: .navigationBar)
+                    // No opaque bar background: on iOS 27 it is drawn as an
+                    // edge effect that darkens the top of the canvas, hiding
+                    // remote pixels and the status badge. The canvas color
+                    // already matches the bar.
                     .toolbarColorScheme(.dark, for: .navigationBar)
 
             case .floatingTrailingRail,
@@ -242,6 +266,9 @@ struct RemoteSessionView: View {
                 .frame(width: 22, height: 22)
         }
         .disabled(!store.acceptsInput)
+        // Under the dark toolbar the system disabled tint is not visible;
+        // dim like the compact dock does.
+        .opacity(store.acceptsInput ? 1 : 0.38)
         .accessibilityLabel(title)
     }
 
@@ -321,13 +348,6 @@ struct RemoteSessionView: View {
     private func stopViewingButtonTapped() {
         isKeyboardPresented = false
         store.send(.stopViewingButtonTapped)
-    }
-
-    private func tap(
-        _ point: Point2D,
-        _ viewport: Viewport
-    ) {
-        store.send(.tap(point: point, viewport: viewport))
     }
 
     private func touch(
@@ -418,6 +438,9 @@ private struct DeviceTitleMenu: View {
                         content.status.label,
                         systemImage: content.status.symbolName
                     )
+                    // Toolbars draw labels icon-only by default; status must
+                    // always be stated in words, not color alone.
+                    .labelStyle(.titleAndIcon)
                     .font(.caption2)
                     .foregroundStyle(headerStatusColor)
                     .lineLimit(1)

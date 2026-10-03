@@ -69,45 +69,6 @@ struct DeviceHubUIPresentationTests {
         )
     }
 
-    @Test("Pairing keeps the controller awake only during an active attempt")
-    func pairingScreenIdlePolicy() {
-        #expect(
-            PairingScreenIdlePolicy.isDisabled(
-                isPairingPresented: true,
-                hasRemediation: false,
-                scenePhase: .active
-            )
-        )
-        #expect(
-            !PairingScreenIdlePolicy.isDisabled(
-                isPairingPresented: false,
-                hasRemediation: false,
-                scenePhase: .active
-            )
-        )
-        #expect(
-            !PairingScreenIdlePolicy.isDisabled(
-                isPairingPresented: true,
-                hasRemediation: true,
-                scenePhase: .active
-            )
-        )
-        #expect(
-            !PairingScreenIdlePolicy.isDisabled(
-                isPairingPresented: true,
-                hasRemediation: false,
-                scenePhase: .inactive
-            )
-        )
-        #expect(
-            !PairingScreenIdlePolicy.isDisabled(
-                isPairingPresented: true,
-                hasRemediation: false,
-                scenePhase: .background
-            )
-        )
-    }
-
     @Test(
         "Toolbar copy represents every selection state without contradictions"
     )

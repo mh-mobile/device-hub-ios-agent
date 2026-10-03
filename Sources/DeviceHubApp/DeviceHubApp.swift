@@ -6,6 +6,7 @@ import DeviceHubPersistence
 import DeviceHubTransport
 import DeviceHubUI
 import SwiftUI
+import UIKit
 
 /// The iOS and iPadOS application shell.
 ///
@@ -18,7 +19,15 @@ struct DeviceHubApp: App {
 
     @MainActor
     init() {
-        AgentHTTPServer.shared.start()   // agents drive the shown device over HTTP (port 8765)
+        // Agents drive the shown device over HTTP (port 8765) only when a
+        // token is configured; see Config/Local.xcconfig.example.
+        AgentHTTPServer.shared.start(
+            policy: AgentAccessPolicy(
+                token: Bundle.main.object(
+                    forInfoDictionaryKey: "DeviceHubAgentToken"
+                ) as? String
+            )
+        )
         #if DEBUG
             switch DeviceHubDebugLaunchSelection(
                 arguments: ProcessInfo.processInfo.arguments
@@ -405,7 +414,41 @@ enum DeviceHubAppComposition {
         Store(initialState: RemoteSessionFeature.State()) {
             RemoteSessionFeature()
         } withDependencies: {
+            $0.backgroundExecution = .uiApplication
             $0.deviceHub = deviceHub
         }
+    }
+}
+
+extension BackgroundExecutionClient {
+    /// Runs work under a UIKit background task so it can finish after the app
+    /// leaves the foreground. The task ends when the work finishes or when iOS
+    /// says background time is about to expire, whichever comes first.
+    static let uiApplication = Self { name, work in
+        let task = await MainActor.run { BackgroundTaskHandle(name: name) }
+        await work()
+        await MainActor.run { task.end() }
+    }
+}
+
+@MainActor
+private final class BackgroundTaskHandle {
+    private var identifier = UIBackgroundTaskIdentifier.invalid
+
+    init(name: String) {
+        // UIKit calls the expiration handler on the main thread.
+        identifier = UIApplication.shared.beginBackgroundTask(
+            withName: name
+        ) { [weak self] in
+            MainActor.assumeIsolated { self?.end() }
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else {
+            return
+        }
+        UIApplication.shared.endBackgroundTask(identifier)
+        identifier = .invalid
     }
 }

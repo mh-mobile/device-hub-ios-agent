@@ -25,7 +25,9 @@ public final class AgentBridge: @unchecked Sendable {
 
     public enum Failure: Error, CustomStringConvertible {
         case noSession
-        public var description: String { "no device is being shown; open one in Device Hub first" }
+        public var description: String {
+            "no device is being shown; open one in Device Hub first"
+        }
     }
 
     /// Target pixel size of the latest frame: the coordinate space for every command.
@@ -45,20 +47,69 @@ public final class AgentBridge: @unchecked Sendable {
     }
 
     public func tap(x: Double, y: Double) async throws {
-        try await send(.tap(TargetPixelPoint(x: x, y: y)))
+        try await send(.tap(nativePoint(x: x, y: y)))
     }
+
+    /// Converts a point in the screenshot (display orientation, the space
+    /// `screenSize()` reports) to the device's native portrait pixels with the
+    /// same mapping the canvas uses. Points outside the screenshot are refused.
+    private func nativePoint(x: Double, y: Double) throws -> TargetPixelPoint {
+        guard let frame = lock.withLock({ frame }) else {
+            throw Failure.noSession
+        }
+        let screenshot = Viewport(
+            origin: Point2D(x: 0, y: 0),
+            size: Size2D(width: Double(frame.image.width), height: Double(frame.image.height))
+        )
+        guard let point = RemoteCoordinateMapper.mapInitialTouch(
+            Point2D(x: x, y: y),
+            in: screenshot,
+            targetPixels: frame.metadata.pixelSize,
+            orientation: frame.metadata.orientation
+        ) else {
+            throw AgentBridgeError("(\(x), \(y)) is outside the \(frame.image.width)x\(frame.image.height) screen")
+        }
+        return point
+    }
+
+    /// The longest drag an agent may request.
+    static let maximumDragDuration = 10.0
 
     /// A one-finger drag from start to end in `steps` moves over `duration` seconds.
     public func drag(from start: (Double, Double), to end: (Double, Double), duration: Double = 0.3, steps: Int = 12) async throws {
+        let steps = max(steps, 1)
+        let stepDuration = try Self.dragStepDuration(total: duration, steps: steps)
+        let nativeStart = try nativePoint(x: start.0, y: start.1)
+        let nativeEnd = try nativePoint(x: end.0, y: end.1)
         let point = { (t: Double) in
-            TargetPixelPoint(x: start.0 + (end.0 - start.0) * t, y: start.1 + (end.1 - start.1) * t)
+            TargetPixelPoint(
+                x: nativeStart.x + (nativeEnd.x - nativeStart.x) * t,
+                y: nativeStart.y + (nativeEnd.y - nativeStart.y) * t
+            )
         }
         try await send(.touch(TouchCommand(contactID: 0, point: point(0), phase: .began)))
-        for step in 1...max(steps, 1) {
-            try await Task.sleep(for: .seconds(duration / Double(max(steps, 1))))
-            try await send(.touch(TouchCommand(contactID: 0, point: point(Double(step) / Double(max(steps, 1))), phase: .moved)))
+        var last = point(0)
+        do {
+            for step in 1 ... steps {
+                try await Task.sleep(for: stepDuration)
+                last = point(Double(step) / Double(steps))
+                try await send(.touch(TouchCommand(contactID: 0, point: last, phase: .moved)))
+            }
+            try await send(.touch(TouchCommand(contactID: 0, point: point(1), phase: .ended)))
+        } catch {
+            // The finger is down on the device; lift it before reporting.
+            try? await send(.touch(TouchCommand(contactID: 0, point: last, phase: .cancelled)))
+            throw error
         }
-        try await send(.touch(TouchCommand(contactID: 0, point: point(1), phase: .ended)))
+    }
+
+    /// Rejects a duration outside `0...maximumDragDuration` (including NaN and
+    /// infinity) before it reaches `Duration`, which traps on huge values.
+    static func dragStepDuration(total: Double, steps: Int) throws -> Duration {
+        guard total.isFinite, (0 ... maximumDragDuration).contains(total) else {
+            throw AgentBridgeError("duration must be between 0 and \(maximumDragDuration) seconds")
+        }
+        return .milliseconds((total * 1000 / Double(max(steps, 1))).rounded())
     }
 
     public func type(_ text: String) async throws {
@@ -95,5 +146,7 @@ public final class AgentBridge: @unchecked Sendable {
 
 public struct AgentBridgeError: Error, CustomStringConvertible {
     public let description: String
-    public init(_ description: String) { self.description = description }
+    public init(_ description: String) {
+        self.description = description
+    }
 }

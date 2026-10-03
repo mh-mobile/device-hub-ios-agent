@@ -7,6 +7,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def task_scripts(configuration: dict, task_names: list[str]) -> list[str]:
+    """Return the repository scripts run by the given non-media tasks."""
+    scripts = []
+    for name in task_names:
+        if name == "test:media":
+            continue
+        run = configuration["tasks"][name]["run"]
+        for word in str(run).split():
+            path = ROOT / word.strip("'\"[]{},")
+            if path.suffix == ".sh" and path.is_file():
+                scripts.append(path.read_text())
+    return scripts
+
+
 class MiseToolingContractTests(unittest.TestCase):
     def test_hosted_ci_shell_dependencies_are_managed_by_mise(self) -> None:
         configuration = tomllib.loads((ROOT / "mise.toml").read_text())
@@ -26,6 +40,25 @@ class MiseToolingContractTests(unittest.TestCase):
         ]
 
         self.assertEqual(1, task_names.count("test:media"))
+        for script in task_scripts(configuration, task_names):
+            self.assertNotIn("DeviceHubPrivateMedia/Tests/run-tests.sh", script)
+
+    def test_swift_package_scripts_use_the_selected_xcode_toolchain(self) -> None:
+        # A swift on PATH (swiftly, Homebrew) may predate the package's tools
+        # version; xcrun resolves the same toolchain xcodebuild uses.
+        for name in ("test-core.sh", "render-local-previews.sh"):
+            script = (ROOT / "Scripts" / name).read_text()
+            for line in script.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("swift test", "swift run")):
+                    self.fail(f"{name}: {stripped}")
+
+    def test_ios_only_package_tests_run_in_the_simulator(self) -> None:
+        script = (ROOT / "Scripts" / "test-app.sh").read_text()
+
+        self.assertIn(
+            "-only-testing:DeviceHubUITests/DeviceKeyboardReceiverTests", script
+        )
 
     def test_full_ci_verifies_the_packaged_protocol_once(self) -> None:
         script = (ROOT / "ci" / "run_ci.sh").read_text()

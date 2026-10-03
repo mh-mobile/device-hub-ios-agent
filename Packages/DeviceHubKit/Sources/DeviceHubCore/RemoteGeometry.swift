@@ -54,6 +54,19 @@ public struct TargetPixelPoint: Equatable, Sendable {
         self.x = x
         self.y = y
     }
+
+    /// Whether the point names an existing pixel of a `pixelSize` target:
+    /// finite and within `0...size - 1` on both axes. Command validation and
+    /// native encoding both use this rule, so a point one accepts the other
+    /// can encode.
+    public func isAddressable(in pixelSize: PixelSize) -> Bool {
+        pixelSize.width > 0
+            && pixelSize.height > 0
+            && x.isFinite
+            && y.isFinite
+            && (0 ... Double(pixelSize.width - 1)).contains(x)
+            && (0 ... Double(pixelSize.height - 1)).contains(y)
+    }
 }
 
 /// Rotation of displayed pixels relative to native portrait target coordinates.

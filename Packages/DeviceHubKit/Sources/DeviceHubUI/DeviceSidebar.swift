@@ -9,8 +9,6 @@ enum DeviceSidebarMetrics {
 }
 
 struct DeviceSidebar: View {
-    @Environment(\.colorScheme) private var colorScheme
-
     let devices: [DeviceSummary]
     let isLoading: Bool
     let selectedDeviceID: DeviceID?
@@ -45,6 +43,10 @@ struct DeviceSidebar: View {
             .padding(.bottom, 24)
         }
         .background(.ultraThinMaterial)
+        // The material sits over the near-black canvas in both appearances,
+        // so light-mode foregrounds would be black on black. Render the
+        // sidebar dark everywhere so text, rows, and material agree.
+        .environment(\.colorScheme, .dark)
         .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
         .navigationTitle("Devices")
         .overlay {
@@ -150,35 +152,27 @@ struct DeviceSidebar: View {
     }
 
     private var accentForeground: Color {
-        colorScheme == .dark
-            ? Color(red: 0.48, green: 0.52, blue: 1)
-            : .indigo
+        Color(red: 0.48, green: 0.52, blue: 1)
     }
 
     private var primaryForeground: Color {
-        colorScheme == .dark ? .white : .primary
+        .white
     }
 
     private var secondaryForeground: Color {
-        colorScheme == .dark ? .white.opacity(0.72) : .primary.opacity(0.72)
+        .white.opacity(0.72)
     }
 
     private var rowBackground: Color {
-        colorScheme == .dark
-            ? .white.opacity(0.055)
-            : .white.opacity(0.7)
+        .white.opacity(0.055)
     }
 
     private var rowBorder: Color {
-        colorScheme == .dark
-            ? .white.opacity(0.08)
-            : .black.opacity(0.06)
+        .white.opacity(0.08)
     }
 }
 
 private struct DeviceRow: View {
-    @Environment(\.colorScheme) private var colorScheme
-
     let device: DeviceSummary
     let isSelected: Bool
     let detailsButtonTapped: () -> Void
@@ -256,50 +250,38 @@ private struct DeviceRow: View {
     }
 
     private var accentForeground: Color {
-        colorScheme == .dark
-            ? Color(red: 0.48, green: 0.52, blue: 1)
-            : .indigo
+        Color(red: 0.48, green: 0.52, blue: 1)
     }
 
     private var primaryForeground: Color {
-        colorScheme == .dark ? .white : .primary
+        .white
     }
 
     private var secondaryForeground: Color {
-        colorScheme == .dark ? .white.opacity(0.72) : .primary.opacity(0.72)
+        .white.opacity(0.72)
     }
 
     private var statusForeground: Color {
         if device.pairingState == .requiresPairing
             || device.reachability == .unavailable
         {
-            return colorScheme == .dark
-                ? Color.orange.opacity(0.9)
-                : Color(
-                    red: 0.58,
-                    green: 0.25,
-                    blue: 0.015
-                )
+            return Color.orange.opacity(0.9)
         }
         return secondaryForeground
     }
 
     private var rowBackground: Color {
         if isSelected {
-            return accentForeground.opacity(colorScheme == .dark ? 0.16 : 0.1)
+            return accentForeground.opacity(0.16)
         }
-        return colorScheme == .dark
-            ? .white.opacity(0.055)
-            : .white.opacity(0.7)
+        return .white.opacity(0.055)
     }
 
     private var rowBorder: Color {
         if isSelected {
-            return accentForeground.opacity(colorScheme == .dark ? 0.72 : 0.5)
+            return accentForeground.opacity(0.72)
         }
-        return colorScheme == .dark
-            ? .white.opacity(0.08)
-            : .black.opacity(0.06)
+        return .white.opacity(0.08)
     }
 
     private var deviceSymbolName: String {

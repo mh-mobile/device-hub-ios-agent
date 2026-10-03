@@ -4,6 +4,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -43,7 +47,7 @@ use crate::{
     png::validate_png,
     session::{
         ControlCommand, ControlGate, EventEmitter, MediaEmitter, PersistenceGate, PublicFailure,
-        RsdSnapshot,
+        RsdSnapshot, collapse_moves,
     },
 };
 
@@ -64,6 +68,21 @@ const VIDEO_FEEDBACK_INTERVAL: Duration = Duration::from_secs(1);
 // The device often ignores a lone PLI/FIR, and without a retry the picture stays
 // frozen until its own periodic keyframe (up to a minute). Re-ask until one lands.
 const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+// Losses close together each report a discontinuity; one request per second
+// is enough, and the retry above covers a request the device ignored.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
+// Refreshing orientation on a sync sample blocks the receive loop; keep it short.
+const ORIENTATION_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
+// Lock wait plus answer wait stays below MEDIA_STALL_TIMEOUT on both paths:
+// the query runs inside the video branch.
+const ORIENTATION_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+// A new configuration needs the orientation, so it waits longer for a
+// rotation to release the client than a sync access unit does.
+const ORIENTATION_CONFIGURATION_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
+// The device keeps sending RTCP sender reports while the screen is static, so a
+// silent video socket means the path is gone (airplane mode, lost access point).
+// Without this the session stayed "Live" until the kernel's TCP timeout.
+const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_TIMEOUT: Duration = Duration::from_secs(12);
 const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 const MEDIA_STOP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -623,7 +642,7 @@ async fn run_control_stream(
             UniversalHidServiceClient::connect_rsd(adapter, handshake),
         )
         .await?;
-        let mut indigo_hid = stage(
+        let indigo_hid = stage(
             INPUT_TIMEOUT,
             input_service_connection_failed(),
             IndigoHidClient::connect_rsd(adapter, handshake),
@@ -648,6 +667,23 @@ async fn run_control_stream(
         )
         .await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // Shared with the input task, which rotates; video queries it.
+        let orientation = Arc::new(tokio::sync::Mutex::new(orientation));
+        // HID writes and tap holds run in their own task, so a slow HID round
+        // trip or a held button never stops video datagrams from being read,
+        // and video waiting on the orientation lock never stops the rotation
+        // that holds it.
+        let (input_commands, input_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let input_stopping = Arc::new(AtomicBool::new(false));
+        let mut input_task = AbortOnDrop(tokio::spawn(run_input_loop(
+            input_receiver,
+            Arc::clone(&input_stopping),
+            universal_hid,
+            keyboard_service_id,
+            indigo_hid,
+            Arc::clone(&orientation),
+        )));
+        let mut input_finished = false;
         controls.enable_input();
         emitter.input_ready()?;
         emitter.phase(DhConnectionPhase::Streaming, DhSessionState::Connected)?;
@@ -670,10 +706,10 @@ async fn run_control_stream(
         update_geometry_orientation(&mut video.geometry, &initial_orientation)?;
         let mut audio_open = true;
         let mut last_audio_sequence: Option<u16> = None;
-        let mut cleanup = InputCleanupState::default();
         let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
         tokio::pin!(first_video_frame_deadline);
         let mut has_emitted_video_access_unit = false;
+        let mut last_video_datagram = std::time::Instant::now();
         let feedback_started_at = tokio::time::Instant::now();
         let mut feedback_timer = tokio::time::interval_at(
             feedback_started_at + VIDEO_FEEDBACK_INTERVAL,
@@ -681,7 +717,12 @@ async fn run_control_stream(
         );
         feedback_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut feedback =
-            VideoFeedbackState::new(our_video_ssrc, negotiated_video.ssrc, video_call_id);
+            VideoFeedbackState::new(
+                our_video_ssrc,
+                negotiated_video.ssrc,
+                video_call_id,
+                std::time::Instant::now(),
+            );
         // The device sends RTP and RTCP from its own port, not the senderPort we
         // offered; RTCP sent to the offered port is silently dropped, so PLI/FIR
         // and receiver reports never arrive. Reply to wherever the video comes from.
@@ -694,12 +735,71 @@ async fn run_control_stream(
                     let _ = changed;
                     break Ok(());
                 }
+                // Input before media: under heavy motion a video datagram is
+                // almost always ready, and with media first a queued touch
+                // waited behind the whole burst. Moves are collapsed when
+                // received, so input cannot hold the loop for long.
+                command = controls.receive() => {
+                    let Some(command) = command else {
+                        break Err(PublicFailure::new(
+                            "control_channel_closed",
+                            "control_stream",
+                            false,
+                            "The native control channel closed unexpectedly.",
+                        ));
+                    };
+                    match command {
+                        ControlCommand::VideoControlDatagram(datagram) => {
+                            if video_udp
+                                .send_to(video_peer_port, datagram.bytes)
+                                .await
+                                .is_err()
+                            {
+                                break Err(video_control_delivery_failed());
+                            }
+                        }
+                        ControlCommand::VideoNegotiation => break Err(stale_video_negotiation()),
+                        // The input loop owns the receiver until teardown.
+                        command => {
+                            let _ = input_commands.send(command);
+                        }
+                    }
+                }
+                result = &mut input_task.0, if !input_finished => {
+                    input_finished = true;
+                    break Err(match result {
+                        Ok(Err(failure)) => failure,
+                        Ok(Ok(())) | Err(_) => PublicFailure::new(
+                            "control_channel_closed",
+                            "control_stream",
+                            false,
+                            "The native input loop ended unexpectedly.",
+                        ),
+                    });
+                }
+                // Ahead of the media sockets: under a constant datagram flood
+                // the biased select would otherwise never reach the receiver
+                // reports or the stall check.
+                _ = feedback_timer.tick() => {
+                    let now = std::time::Instant::now();
+                    if has_emitted_video_access_unit
+                        && video_stream_stalled(last_video_datagram, now)
+                    {
+                        break Err(media_stalled());
+                    }
+                    let retry = feedback.keyframe_retry(now);
+                    for datagram in feedback.periodic_report().into_iter().chain(retry) {
+                        if video_udp.send_to(video_peer_port, datagram).await.is_err() {
+                            break 'stream Err(video_control_delivery_failed());
+                        }
+                    }
+                }
                 // Device audio: each RTP payload is one raw AAC-ELD frame. Handed to
                 // the controller through the datagram event, which the app plays.
                 datagram = audio_udp.recv(), if audio_open => {
                     match datagram {
-                        Ok(datagram) if !is_rtcp(&datagram.data) => {
-                            if let Ok(packet) = RtpPacket::parse_checked(&datagram.data) {
+                        Ok(datagram) => {
+                            if let Some(packet) = audio_rtp_packet(&datagram.data) {
                                 if let Some(last) = last_audio_sequence
                                     && packet.sequence_number != last.wrapping_add(1)
                                 {
@@ -713,19 +813,19 @@ async fn run_control_stream(
                                 );
                             }
                         }
-                        Ok(_) => {}
                         Err(_) => audio_open = false,
                     }
                 }
                 datagram = video_udp.recv() => {
                     match datagram {
                         Ok(datagram) => {
+                            last_video_datagram = std::time::Instant::now();
                             video_peer_port = datagram.source_port;
                             match process_live_video_datagram(
                                 datagram.data,
                                 datagram.source_port,
                                 &mut video,
-                                &mut orientation,
+                                &orientation,
                                 media,
                                 emitter,
                             ).await {
@@ -754,14 +854,6 @@ async fn run_control_stream(
                         }
                     }
                 }
-                _ = feedback_timer.tick() => {
-                    let retry = feedback.keyframe_retry(std::time::Instant::now());
-                    for datagram in feedback.periodic_report().into_iter().chain(retry) {
-                        if video_udp.send_to(video_peer_port, datagram).await.is_err() {
-                            break 'stream Err(video_control_delivery_failed());
-                        }
-                    }
-                }
                 () = &mut first_video_frame_deadline, if !has_emitted_video_access_unit => {
                     break Err(PublicFailure::new(
                         "video_stream_start_timed_out",
@@ -770,44 +862,20 @@ async fn run_control_stream(
                         "The authenticated display stream did not produce a complete video frame in time.",
                     ));
                 }
-                command = controls.receive() => {
-                    let Some(command) = command else {
-                        break Err(PublicFailure::new(
-                            "control_channel_closed",
-                            "control_stream",
-                            false,
-                            "The native control channel closed unexpectedly.",
-                        ));
-                    };
-                    let trace_label = input_trace_label(&command);
-                    if let Err(failure) = handle_control_command(
-                            command,
-                            &video_udp,
-                            video_peer_port,
-                            &mut universal_hid,
-                            keyboard_service_id,
-                            &mut indigo_hid,
-                            &mut orientation,
-                            &mut cleanup,
-                        )
-                        .await
-                    {
-                        break Err(failure);
-                    }
-                    if let Some(trace_label) = trace_label {
-                        input_trace("delivered", &trace_label);
-                    }
-                }
             }
         };
 
-        cleanup_inputs(
-            &mut cleanup,
-            &mut universal_hid,
-            keyboard_service_id,
-            &mut indigo_hid,
-        )
-        .await;
+        // Stop taking queued input, then let the input loop release anything
+        // still held before the media stream is stopped.
+        input_stopping.store(true, Ordering::Release);
+        drop(input_commands);
+        if !input_finished
+            && tokio::time::timeout(INPUT_TIMEOUT + INPUT_CLEANUP_TIMEOUT, &mut input_task.0)
+                .await
+                .is_err()
+        {
+            input_task.0.abort();
+        }
         result
     }
     .await;
@@ -1102,6 +1170,56 @@ async fn handle_keyboard_intent_with_sink(
     Ok(())
 }
 
+/// Aborts the task when dropped, so an early return from the stream never
+/// leaves the input task holding the HID clients.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Reads the orientation for a sync access unit, best effort.
+///
+/// If rotation holds the client longer than `lock_timeout`, the last
+/// orientation is kept. Once a request is sent its answer must be read
+/// (answers are not matched to requests), so a query that does not answer
+/// within `answer_timeout` ends the session instead of misaligning every
+/// later answer.
+async fn refresh_orientation<C, T, E>(
+    client: &tokio::sync::Mutex<C>,
+    lock_timeout: Duration,
+    answer_timeout: Duration,
+    query: impl AsyncFnOnce(&mut C) -> Result<T, E>,
+) -> Result<Option<T>, PublicFailure> {
+    let Ok(mut client) = tokio::time::timeout(lock_timeout, client.lock()).await else {
+        return Ok(None);
+    };
+    match tokio::time::timeout(answer_timeout, query(&mut client)).await {
+        Ok(answer) => Ok(answer.ok()),
+        Err(_) => Err(orientation_state_failed()),
+    }
+}
+
+/// Reads the orientation a new video configuration needs; any failure ends
+/// the session. Like `refresh_orientation`, the lock and answer waits are
+/// bounded separately so their sum stays below the stall timeout.
+async fn read_orientation<C, T, E>(
+    client: &tokio::sync::Mutex<C>,
+    lock_timeout: Duration,
+    answer_timeout: Duration,
+    query: impl AsyncFnOnce(&mut C) -> Result<T, E>,
+) -> Result<T, PublicFailure> {
+    let mut client = tokio::time::timeout(lock_timeout, client.lock())
+        .await
+        .map_err(|_| orientation_state_failed())?;
+    match tokio::time::timeout(answer_timeout, query(&mut client)).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(_)) | Err(_) => Err(orientation_state_failed()),
+    }
+}
+
 trait HardwareButtonSink {
     async fn send(&mut self, button: HardwareButton, state: ButtonState) -> Result<(), HidError>;
 }
@@ -1121,7 +1239,9 @@ fn hardware_button_tap_hold(button: HardwareButton) -> Duration {
     }
 }
 
-impl HardwareButtonSink for IndigoHidClient<Box<dyn idevice::ReadWrite>> {
+// Generic over the object lifetime: inside the spawned input task the
+// compiler cannot prove the client's `dyn` is `'static` for every borrow.
+impl<'a> HardwareButtonSink for IndigoHidClient<Box<dyn idevice::ReadWrite + 'a>> {
     async fn send(&mut self, button: HardwareButton, state: ButtonState) -> Result<(), HidError> {
         self.send_hardware_button(button, state).await
     }
@@ -1180,21 +1300,89 @@ fn remove_last_button(buttons: &mut Vec<HardwareButton>, button: HardwareButton)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_control_command(
+/// Owns HID delivery for one stream: commands arrive in order, consecutive
+/// moves collapse to the latest, and held inputs are released on exit.
+async fn run_input_loop(
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<ControlCommand>,
+    stopping: Arc<AtomicBool>,
+    mut universal_hid: UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
+    keyboard_service_id: u64,
+    mut indigo_hid: IndigoHidClient<Box<dyn idevice::ReadWrite>>,
+    orientation: Arc<tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>>,
+) -> Result<(), PublicFailure> {
+    let mut cleanup = InputCleanupState::default();
+    let mut stashed = None;
+    let result = loop {
+        let command = match stashed.take() {
+            Some(command) => command,
+            None => match commands.recv().await {
+                Some(command) => command,
+                None => break Ok(()),
+            },
+        };
+        if stopping.load(Ordering::Acquire) {
+            break Ok(());
+        }
+        let command = collapse_moves(command, || commands.try_recv().ok(), &mut stashed);
+        let trace_label = input_trace_label(&command);
+        // A HID call that never answers fails the session instead of silently
+        // swallowing every later input while video keeps playing.
+        match tokio::time::timeout(
+            INPUT_TIMEOUT,
+            handle_input_command(
+                command,
+                &mut universal_hid,
+                keyboard_service_id,
+                &mut indigo_hid,
+                &orientation,
+                &mut cleanup,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => break Err(failure),
+            Err(_) => {
+                break Err(PublicFailure::new(
+                    "input_delivery_failed",
+                    "input",
+                    true,
+                    "A native input command did not complete in time.",
+                ));
+            }
+        }
+        if let Some(trace_label) = trace_label {
+            input_trace("delivered", &trace_label);
+        }
+    };
+    cleanup_inputs(
+        &mut cleanup,
+        &mut universal_hid,
+        keyboard_service_id,
+        &mut indigo_hid,
+    )
+    .await;
+    result
+}
+
+async fn handle_input_command(
     command: ControlCommand,
-    video_udp: &tcp::handle::UdpSocketHandle,
-    remote_video_port: u16,
     universal_hid: &mut UniversalHidServiceClient<Box<dyn idevice::ReadWrite>>,
     keyboard_service_id: u64,
     indigo_hid: &mut IndigoHidClient<Box<dyn idevice::ReadWrite>>,
-    orientation: &mut OrientationServiceClient<Box<dyn idevice::ReadWrite>>,
+    orientation: &tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>,
     cleanup: &mut InputCleanupState,
 ) -> Result<(), PublicFailure> {
     match command {
-        ControlCommand::VideoControlDatagram(datagram) => video_udp
-            .send_to(remote_video_port, datagram.bytes)
-            .await
-            .map_err(|_| video_control_delivery_failed()),
+        // The stream loop handles these itself and never forwards them.
+        ControlCommand::VideoControlDatagram(_) | ControlCommand::VideoNegotiation => {
+            Err(PublicFailure::new(
+                "invalid_state",
+                "control_stream",
+                false,
+                "A media control command reached the input loop.",
+            ))
+        }
         ControlCommand::Touch(intent) => {
             match intent {
                 TouchIntent::Tap { x, y } => {
@@ -1252,14 +1440,19 @@ async fn handle_control_command(
                 RotationIntent::Left => RotationDirection::Left,
                 RotationIntent::Right => RotationDirection::Right,
             };
-            orientation.rotate(direction).await.map_err(|_| {
-                PublicFailure::new(
-                    "rotation_failed",
-                    "rotation",
-                    true,
-                    "The authenticated orientation service rejected the rotation.",
-                )
-            })?;
+            orientation
+                .lock()
+                .await
+                .rotate(direction)
+                .await
+                .map_err(|_| {
+                    PublicFailure::new(
+                        "rotation_failed",
+                        "rotation",
+                        true,
+                        "The authenticated orientation service rejected the rotation.",
+                    )
+                })?;
             // A successful control reply does not prove that the encoded
             // display changed. The next video configuration owns geometry.
             Ok(())
@@ -1268,13 +1461,16 @@ async fn handle_control_command(
             release_all_inputs_bounded(cleanup, universal_hid, keyboard_service_id, indigo_hid)
                 .await
         }
-        ControlCommand::VideoNegotiation => Err(PublicFailure::new(
-            "stale_video_negotiation",
-            "video_negotiation",
-            false,
-            "A duplicate video negotiation acknowledgement was received.",
-        )),
     }
+}
+
+const fn stale_video_negotiation() -> PublicFailure {
+    PublicFailure::new(
+        "stale_video_negotiation",
+        "video_negotiation",
+        false,
+        "A duplicate video negotiation acknowledgement was received.",
+    )
 }
 
 struct PreparedVideoDatagram {
@@ -1283,13 +1479,30 @@ struct PreparedVideoDatagram {
 }
 
 impl PreparedVideoDatagram {
+    /// Whether emitting these events sends a new video configuration, which
+    /// requires the device orientation. Mirrors emission order: a
+    /// discontinuity resets the emitted revision, so an access unit after it
+    /// re-sends its configuration.
     fn has_new_configuration(&self, last_configuration_revision: u64) -> bool {
+        let mut revision = last_configuration_revision;
+        self.events.iter().any(|event| match event {
+            HevcDepacketizerEvent::Discontinuity(_) => {
+                revision = 0;
+                false
+            }
+            HevcDepacketizerEvent::AccessUnit(access_unit) => {
+                access_unit.parameter_set_revision > revision
+            }
+            HevcDepacketizerEvent::PacketRejected(_) => false,
+        })
+    }
+
+    /// Whether a sync sample is emitted, where a rotation that kept identical
+    /// parameter sets (a 180° turn) becomes visible; its orientation refresh
+    /// is best effort.
+    fn has_sync_access_unit(&self) -> bool {
         self.events.iter().any(|event| {
-            matches!(
-                event,
-                HevcDepacketizerEvent::AccessUnit(access_unit)
-                    if access_unit.parameter_set_revision > last_configuration_revision
-            )
+            matches!(event, HevcDepacketizerEvent::AccessUnit(access_unit) if access_unit.is_sync)
         })
     }
 }
@@ -1327,10 +1540,15 @@ struct VideoFeedbackState {
     previous_report: (u32, u32),
     // When the last keyframe request went out, while no sync frame has arrived since.
     pending_keyframe_request: Option<std::time::Instant>,
+    last_keyframe_request_sent: Option<std::time::Instant>,
 }
 
 impl VideoFeedbackState {
-    fn new(our_ssrc: u32, media_ssrc: u32, cname: String) -> Self {
+    /// `started_at` counts as an outstanding keyframe request: if the first
+    /// IDR is lost before anything was assembled, no discontinuity is ever
+    /// reported, and without this the picture waits for the device's own
+    /// periodic keyframe.
+    fn new(our_ssrc: u32, media_ssrc: u32, cname: String, started_at: std::time::Instant) -> Self {
         Self {
             base_sequence_number: None,
             cname,
@@ -1340,7 +1558,8 @@ impl VideoFeedbackState {
             our_ssrc,
             received_packets: 0,
             previous_report: (0, 0),
-            pending_keyframe_request: None,
+            pending_keyframe_request: Some(started_at),
+            last_keyframe_request_sent: None,
         }
     }
 
@@ -1356,7 +1575,15 @@ impl VideoFeedbackState {
             self.pending_keyframe_request = None;
         }
         if outcome.requires_keyframe {
-            datagrams.push(self.keyframe_request(now));
+            let recently_sent = self.last_keyframe_request_sent.is_some_and(|sent| {
+                now.saturating_duration_since(sent) < KEYFRAME_REQUEST_MIN_INTERVAL
+            });
+            if recently_sent {
+                // Still outstanding; keyframe_retry re-sends it if ignored.
+                self.pending_keyframe_request.get_or_insert(now);
+            } else {
+                datagrams.push(self.keyframe_request(now));
+            }
         }
         datagrams
     }
@@ -1370,6 +1597,7 @@ impl VideoFeedbackState {
     fn keyframe_request(&mut self, now: std::time::Instant) -> Vec<u8> {
         input_trace("video", "keyframe_request");
         self.pending_keyframe_request = Some(now);
+        self.last_keyframe_request_sent = Some(now);
         let request = build_keyframe_request(
             self.our_ssrc,
             &self.cname,
@@ -1430,7 +1658,7 @@ async fn process_live_video_datagram(
     bytes: Vec<u8>,
     source_port: u16,
     video: &mut LiveVideoState,
-    orientation: &mut OrientationServiceClient<Box<dyn idevice::ReadWrite>>,
+    orientation: &tokio::sync::Mutex<OrientationServiceClient<Box<dyn idevice::ReadWrite>>>,
     media: &MediaEmitter,
     emitter: &EventEmitter,
 ) -> Result<VideoDatagramOutcome, PublicFailure> {
@@ -1447,13 +1675,22 @@ async fn process_live_video_datagram(
     let authoritative_orientation =
         if prepared.has_new_configuration(video.last_configuration_revision) {
             Some(
-                stage(
-                    INPUT_TIMEOUT,
-                    orientation_state_failed(),
-                    orientation.current_orientation(),
+                read_orientation(
+                    orientation,
+                    ORIENTATION_CONFIGURATION_LOCK_TIMEOUT,
+                    ORIENTATION_ANSWER_TIMEOUT,
+                    async |client| client.current_orientation().await,
                 )
                 .await?,
             )
+        } else if prepared.has_sync_access_unit() {
+            refresh_orientation(
+                orientation,
+                ORIENTATION_REFRESH_TIMEOUT,
+                ORIENTATION_ANSWER_TIMEOUT,
+                async |client| client.current_orientation().await,
+            )
+            .await?
         } else {
             None
         };
@@ -1557,7 +1794,12 @@ fn emit_prepared_video_datagram(
         match event {
             HevcDepacketizerEvent::AccessUnit(access_unit) => {
                 let rtp_timestamp = access_unit.rtp_timestamp;
-                outcome.emitted_sync_access_unit |= access_unit.is_sync;
+                if access_unit.is_sync {
+                    // A sync sample after an earlier discontinuity in this
+                    // batch already recovered the picture.
+                    outcome.emitted_sync_access_unit = true;
+                    outcome.requires_keyframe = false;
+                }
                 if access_unit.parameter_set_revision > *last_configuration_revision {
                     let orientation =
                         authoritative_orientation.ok_or_else(orientation_state_failed)?;
@@ -1576,6 +1818,18 @@ fn emit_prepared_video_datagram(
                     let concrete_orientation = concrete_orientation_from_raw(geometry.orientation)?;
                     media.video_configuration(configuration, concrete_orientation)?;
                     emit_display_geometry_if_complete(emitter, *geometry)?;
+                } else if access_unit.is_sync
+                    && let Some(orientation) = authoritative_orientation
+                {
+                    // An undetermined answer (face up, no known non-flat
+                    // orientation) keeps the previous geometry.
+                    let mut refreshed = *geometry;
+                    if update_geometry_orientation(&mut refreshed, orientation).is_ok()
+                        && refreshed.orientation != geometry.orientation
+                    {
+                        *geometry = refreshed;
+                        emit_display_geometry_if_complete(emitter, *geometry)?;
+                    }
                 }
                 media.video_access_unit(access_unit, *geometry)?;
                 outcome.completed_frame_timestamps.push(rtp_timestamp);
@@ -1607,6 +1861,28 @@ fn process_video_datagram(
     media: &MediaEmitter,
     emitter: &EventEmitter,
 ) -> Result<bool, PublicFailure> {
+    Ok(process_video_datagram_outcome(
+        bytes,
+        source_port,
+        assembler,
+        last_configuration_revision,
+        geometry,
+        media,
+        emitter,
+    )?
+    .emitted_access_unit)
+}
+
+#[cfg(test)]
+fn process_video_datagram_outcome(
+    bytes: Vec<u8>,
+    source_port: u16,
+    assembler: &mut HevcAccessUnitAssembler,
+    last_configuration_revision: &mut u64,
+    geometry: &mut DhDisplayGeometry,
+    media: &MediaEmitter,
+    emitter: &EventEmitter,
+) -> Result<VideoDatagramOutcome, PublicFailure> {
     let Some(prepared) = prepare_video_datagram(
         bytes,
         source_port,
@@ -1615,13 +1891,13 @@ fn process_video_datagram(
         media,
     )?
     else {
-        return Ok(false);
+        return Ok(VideoDatagramOutcome::default());
     };
     let orientation = prepared
         .has_new_configuration(*last_configuration_revision)
         .then(|| test_orientation_state(*geometry))
         .transpose()?;
-    Ok(emit_prepared_video_datagram(
+    emit_prepared_video_datagram(
         prepared,
         assembler,
         last_configuration_revision,
@@ -1629,8 +1905,7 @@ fn process_video_datagram(
         orientation.as_ref(),
         media,
         emitter,
-    )?
-    .emitted_access_unit)
+    )
 }
 
 #[cfg(test)]
@@ -1928,6 +2203,34 @@ const fn orientation_state_failed() -> PublicFailure {
         "rotation",
         true,
         "The authenticated orientation service did not return its current state.",
+    )
+}
+
+/// The RTP packet of an audio datagram worth forwarding, or `None`.
+///
+/// Media datagram events must carry at least one byte (the Swift decoder fails
+/// the whole session otherwise), so RTCP, malformed packets, and header-only or
+/// padding-only RTP are dropped here instead of reaching the controller.
+fn audio_rtp_packet(datagram: &[u8]) -> Option<RtpPacket<'_>> {
+    if is_rtcp(datagram) {
+        return None;
+    }
+    RtpPacket::parse_checked(datagram)
+        .ok()
+        .filter(|packet| !packet.payload.is_empty())
+}
+
+/// Whether an established video stream has gone silent for too long.
+fn video_stream_stalled(last_datagram: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(last_datagram) >= MEDIA_STALL_TIMEOUT
+}
+
+const fn media_stalled() -> PublicFailure {
+    PublicFailure::new(
+        "media_stalled",
+        "video_stream",
+        true,
+        "The authenticated video stream stopped delivering datagrams.",
     )
 }
 
@@ -2466,6 +2769,49 @@ fn event_failure_as_idevice(_: PublicFailure) -> idevice::IdeviceError {
 mod tests {
     use std::{collections::HashMap, ffi::c_void, sync::Mutex};
 
+    #[test]
+    fn only_audio_rtp_with_a_payload_is_forwarded() {
+        let header = [0x80, 0x60, 0x00, 0x01, 0, 0, 0, 1, 0, 0, 0, 2];
+        let mut with_payload = header.to_vec();
+        with_payload.extend_from_slice(&[0xAB, 0xCD]);
+        assert_eq!(
+            audio_rtp_packet(&with_payload).map(|packet| packet.payload.to_vec()),
+            Some(vec![0xAB, 0xCD])
+        );
+        assert!(audio_rtp_packet(&header).is_none(), "header-only RTP");
+        let mut padding_only = header.to_vec();
+        padding_only[0] |= 0x20;
+        padding_only.extend_from_slice(&[0, 0, 0, 4]);
+        assert!(
+            audio_rtp_packet(&padding_only).is_none(),
+            "padding-only RTP"
+        );
+        assert!(
+            audio_rtp_packet(&[0x81, 0xC9, 0x00, 0x01, 0, 0, 0, 1]).is_none(),
+            "RTCP"
+        );
+        assert!(audio_rtp_packet(&[0x80]).is_none(), "truncated");
+    }
+
+    #[test]
+    fn a_silent_video_socket_stalls_only_after_the_timeout() {
+        let start = std::time::Instant::now();
+
+        assert!(!video_stream_stalled(start, start));
+        assert!(!video_stream_stalled(
+            start,
+            start + MEDIA_STALL_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(video_stream_stalled(start, start + MEDIA_STALL_TIMEOUT));
+        assert!(
+            !video_stream_stalled(start + Duration::from_secs(1), start),
+            "a datagram newer than the tick is not a stall"
+        );
+        let failure = media_stalled();
+        assert_eq!(failure.code, "media_stalled");
+        assert!(failure.retryable);
+    }
+
     use super::*;
     use crate::{
         abi::{DhEvent, DhGeneration},
@@ -2703,6 +3049,148 @@ mod tests {
             .await
             .map_err(|_| "RSD handshake timed out".to_owned())?
             .map_err(|error| format!("RSD handshake failed: {error}"))
+    }
+
+    #[test]
+    fn a_sync_sample_applies_the_current_orientation_without_new_parameter_sets() {
+        // Turning a landscape device 180° can keep identical parameter sets, so
+        // orientation cannot depend on a new configuration revision.
+        let capture = ProtocolMediaCapture::default();
+        let media = test_media_emitter(&capture);
+        let control = EventEmitterTestFixture::new();
+        let emitter = control.emitter();
+        let mut assembler = HevcAccessUnitAssembler::new(TEST_VIDEO_PAYLOAD_TYPE, TEST_VIDEO_SSRC);
+        let mut last_configuration_revision = 0;
+        let mut geometry = test_geometry();
+        prime_test_video_stream(
+            &mut assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            &media,
+            &emitter,
+        );
+        capture.events.lock().unwrap().clear();
+
+        let prepared = prepare_video_datagram(
+            test_rtp_datagram(TEST_VIDEO_PAYLOAD_TYPE, 4, 4, true, &test_nal(19, &[0xF1])),
+            VIDEO_SENDER_PORT,
+            &mut assembler,
+            &mut last_configuration_revision,
+            &media,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!prepared.has_new_configuration(last_configuration_revision));
+        assert!(prepared.has_sync_access_unit());
+        let mut flipped = geometry;
+        flipped.orientation = DhOrientation::PortraitUpsideDown as u32;
+        flipped.non_flat_orientation = DhOrientation::PortraitUpsideDown as u32;
+        let orientation = test_orientation_state(flipped).unwrap();
+        emit_prepared_video_datagram(
+            prepared,
+            &assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            Some(&orientation),
+            &media,
+            &emitter,
+        )
+        .unwrap();
+
+        {
+            let events = capture.events.lock().unwrap();
+            let access_unit_geometry = events.last().unwrap().1.unwrap();
+            assert_eq!(
+                access_unit_geometry.orientation,
+                DhOrientation::PortraitUpsideDown as u32
+            );
+        }
+        assert_eq!(
+            geometry.orientation,
+            DhOrientation::PortraitUpsideDown as u32
+        );
+
+        // A face-up device with no known non-flat orientation is not an error
+        // on this best-effort path: the previous orientation stays.
+        let prepared = prepare_video_datagram(
+            test_rtp_datagram(TEST_VIDEO_PAYLOAD_TYPE, 5, 5, true, &test_nal(19, &[0xF2])),
+            VIDEO_SENDER_PORT,
+            &mut assembler,
+            &mut last_configuration_revision,
+            &media,
+        )
+        .unwrap()
+        .unwrap();
+        let undetermined = OrientationState {
+            orientation: Orientation::FaceUp,
+            non_flat_orientation: Orientation::Unknown("unknown".into()),
+            locked: false,
+        };
+        emit_prepared_video_datagram(
+            prepared,
+            &assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            Some(&undetermined),
+            &media,
+            &emitter,
+        )
+        .unwrap();
+        assert_eq!(
+            geometry.orientation,
+            DhOrientation::PortraitUpsideDown as u32
+        );
+    }
+
+    #[test]
+    fn a_sync_sample_after_a_gap_in_the_same_batch_needs_no_keyframe_request() {
+        let capture = ProtocolMediaCapture::default();
+        let media = test_media_emitter(&capture);
+        let control = EventEmitterTestFixture::new();
+        let emitter = control.emitter();
+        let mut assembler = HevcAccessUnitAssembler::new(TEST_VIDEO_PAYLOAD_TYPE, TEST_VIDEO_SSRC);
+        let mut last_configuration_revision = 0;
+        let mut geometry = test_geometry();
+        prime_test_video_stream(
+            &mut assembler,
+            &mut last_configuration_revision,
+            &mut geometry,
+            &media,
+            &emitter,
+        );
+
+        // Sequence 4 is lost; the IDR at 5 is drained together with the gap.
+        let mut outcome = VideoDatagramOutcome::default();
+        for (sequence, payload) in [
+            (5u16, test_nal(19, &[0xF0])),
+            (6, test_nal(1, &[0x61])),
+            (7, test_nal(1, &[0x62])),
+        ] {
+            let next = process_video_datagram_outcome(
+                test_rtp_datagram(
+                    TEST_VIDEO_PAYLOAD_TYPE,
+                    sequence,
+                    u32::from(sequence),
+                    true,
+                    &payload,
+                ),
+                VIDEO_SENDER_PORT,
+                &mut assembler,
+                &mut last_configuration_revision,
+                &mut geometry,
+                &media,
+                &emitter,
+            )
+            .unwrap();
+            outcome.emitted_sync_access_unit |= next.emitted_sync_access_unit;
+            outcome.requires_keyframe = next.requires_keyframe
+                || (outcome.requires_keyframe && !next.emitted_sync_access_unit);
+        }
+        assert!(outcome.emitted_sync_access_unit, "the IDR was decoded");
+        assert!(
+            !outcome.requires_keyframe,
+            "the IDR after the gap already recovered the picture"
+        );
     }
 
     #[test]
@@ -3084,6 +3572,109 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![DhEventKind::VideoAccessUnit]
         );
+    }
+
+    #[test]
+    fn orientation_answer_wait_ends_before_the_stall_check_fires() {
+        // The query runs inside the video branch; a wait as long as the
+        // stall timeout would let the next feedback tick end a healthy
+        // stream as stalled before the queued datagrams are read.
+        assert!(ORIENTATION_REFRESH_TIMEOUT + ORIENTATION_ANSWER_TIMEOUT < MEDIA_STALL_TIMEOUT);
+        assert!(
+            ORIENTATION_CONFIGURATION_LOCK_TIMEOUT + ORIENTATION_ANSWER_TIMEOUT
+                < MEDIA_STALL_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_orientation_read_fails_instead_of_waiting_out_a_held_client() {
+        let client = tokio::sync::Mutex::new(());
+        let _rotation = client.lock().await;
+
+        let read = read_orientation(
+            &client,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(1),
+        )
+        .await;
+
+        assert_eq!(
+            read.err().map(|failure| failure.code),
+            Some(orientation_state_failed().code)
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_orientation_read_returns_the_answer() {
+        let client = tokio::sync::Mutex::new(());
+
+        let read = read_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(2),
+        )
+        .await;
+
+        assert_eq!(read.ok(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn orientation_refresh_skips_a_client_held_by_rotation() {
+        let client = tokio::sync::Mutex::new(());
+        let _rotation = client.lock().await;
+
+        let refreshed = refresh_orientation(
+            &client,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(1),
+        )
+        .await;
+
+        assert_eq!(refreshed.ok(), Some(None));
+    }
+
+    #[tokio::test]
+    async fn orientation_refresh_ends_the_session_when_a_sent_query_never_answers() {
+        let client = tokio::sync::Mutex::new(());
+
+        let refreshed = refresh_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            async |_: &mut ()| std::future::pending::<Result<u8, ()>>().await,
+        )
+        .await;
+
+        assert_eq!(
+            refreshed.err().map(|failure| failure.code),
+            Some(orientation_state_failed().code)
+        );
+    }
+
+    #[tokio::test]
+    async fn orientation_refresh_keeps_the_last_state_after_a_failed_answer() {
+        let client = tokio::sync::Mutex::new(());
+
+        let failed = refresh_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            async |_: &mut ()| Err::<u8, ()>(()),
+        )
+        .await;
+        let answered = refresh_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(3),
+        )
+        .await;
+
+        assert_eq!(failed.ok(), Some(None));
+        assert_eq!(answered.ok(), Some(Some(3)));
     }
 
     #[tokio::test]
@@ -3508,6 +4099,56 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_requests_for_losses_close_together_are_coalesced() {
+        let start = std::time::Instant::now();
+        let mut feedback = VideoFeedbackState::new(1, 2, "cname".into(), start);
+        let loss = VideoDatagramOutcome {
+            requires_keyframe: true,
+            ..Default::default()
+        };
+
+        assert_eq!(feedback.consume(&loss, start).len(), 1);
+        assert!(
+            feedback
+                .consume(&loss, start + Duration::from_millis(200))
+                .is_empty(),
+            "a second loss within a second shares the outstanding request"
+        );
+        assert_eq!(
+            feedback
+                .consume(&loss, start + KEYFRAME_REQUEST_MIN_INTERVAL)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_stream_that_never_produced_a_sync_sample_asks_for_one() {
+        let start = std::time::Instant::now();
+        let mut feedback = VideoFeedbackState::new(1, 2, "cname".into(), start);
+
+        assert_eq!(
+            feedback.keyframe_retry(start + Duration::from_secs(1)),
+            None
+        );
+        assert!(
+            feedback
+                .keyframe_retry(start + KEYFRAME_RETRY_INTERVAL)
+                .is_some(),
+            "a lost first IDR is requested again"
+        );
+
+        let mut synced = VideoFeedbackState::new(1, 2, "cname".into(), start);
+        let first_idr = VideoDatagramOutcome {
+            emitted_access_unit: true,
+            emitted_sync_access_unit: true,
+            ..Default::default()
+        };
+        assert!(synced.consume(&first_idr, start).is_empty());
+        assert_eq!(synced.keyframe_retry(start + KEYFRAME_RETRY_INTERVAL), None);
+    }
+
+    #[test]
     fn userspace_video_offer_and_feedback_remain_one_owned_protocol() {
         let our_ssrc = 0x1020_3040;
         let device_ssrc = 0x5060_7080;
@@ -3517,7 +4158,8 @@ mod tests {
         let negotiated_offer = parse_screen_video_answer(&offer).unwrap();
         assert_eq!(negotiated_offer.ssrc, our_ssrc);
 
-        let mut feedback = VideoFeedbackState::new(our_ssrc, device_ssrc, call_id.into());
+        let start = std::time::Instant::now();
+        let mut feedback = VideoFeedbackState::new(our_ssrc, device_ssrc, call_id.into(), start);
         let first = VideoDatagramOutcome {
             completed_frame_timestamps: vec![0xA0B0_C0D0],
             emitted_access_unit: true,
@@ -3525,7 +4167,6 @@ mod tests {
             requires_keyframe: false,
             ..Default::default()
         };
-        let start = std::time::Instant::now();
         assert!(
             feedback.consume(&first, start).is_empty(),
             "no per-frame ACK: it desyncs the encoder under motion"
@@ -3571,10 +4212,19 @@ mod tests {
             "the wraparound is extended and the skipped packet is reported lost"
         );
 
-        assert_eq!(feedback.keyframe_retry(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            feedback.keyframe_retry(start + Duration::from_secs(2)),
+            None
+        );
         assert_eq!(
             feedback.keyframe_retry(start + KEYFRAME_RETRY_INTERVAL),
-            Some(build_keyframe_request(our_ssrc, call_id, device_ssrc, &[], 1)),
+            Some(build_keyframe_request(
+                our_ssrc,
+                call_id,
+                device_ssrc,
+                &[],
+                1
+            )),
             "an ignored keyframe request is repeated"
         );
         let synced = VideoDatagramOutcome {

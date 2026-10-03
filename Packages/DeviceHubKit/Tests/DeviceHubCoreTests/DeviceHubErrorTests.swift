@@ -95,7 +95,7 @@ struct DeviceHubErrorTests {
             .secureConnectionFailed: Expectation(
                 classification: .transient,
                 remedy: .retry,
-                retryability: .automatic
+                retryability: .userInitiated
             ),
             .mediaStalled: Expectation(
                 classification: .transient,
@@ -105,7 +105,7 @@ struct DeviceHubErrorTests {
             .decoderFailed: Expectation(
                 classification: .transient,
                 remedy: .retry,
-                retryability: .automatic
+                retryability: .userInitiated
             )
         ]
 
@@ -145,6 +145,15 @@ struct DeviceHubErrorTests {
             if error.remedy != .none {
                 #expect(!error.remedy.actionTitle.isEmpty)
             }
+        }
+    }
+
+    @Test
+    func onlyAutomaticallyRetriedErrorsSayTheAppIsRecovering() {
+        for error in DeviceHubError.allCases where error.retryability != .automatic {
+            let message = error.userFacing.message.lowercased()
+            #expect(!message.contains("is reconnecting"), "\(error)")
+            #expect(!message.contains("is restarting"), "\(error)")
         }
     }
 

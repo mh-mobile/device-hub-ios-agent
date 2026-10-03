@@ -4255,7 +4255,7 @@ index a75f1f58d4c7126dfa5c4cd5b2e33fdf18820916..c316db33ec92bde42eb6fca30d619e7f
  /// `negotiator_offer` is the zlib+protobuf blob
  /// from [`super::negotiation::MediaNegotiationBlob::to_negotiator_offer`].
 diff --git a/idevice/src/services/core_device/display_stream/hevc.rs b/idevice/src/services/core_device/display_stream/hevc.rs
-index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c979450b3483e 100644
+index f0e4dc29d5b42a3f2e8825807af104b8da071b27..0b2c6065cbb8a081cbf33db5c2f6def991cf60bc 100644
 --- a/idevice/src/services/core_device/display_stream/hevc.rs
 +++ b/idevice/src/services/core_device/display_stream/hevc.rs
 @@ -5,7 +5,9 @@
@@ -4514,7 +4514,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
      }
  
      /// Drain and return all Annex-B output accumulated so far.
-@@ -268,3 +288,2068 @@ fn seq_less_than(a: u16, b: u16) -> bool {
+@@ -268,3 +288,2138 @@ fn seq_less_than(a: u16, b: u16) -> bool {
      let diff = b.wrapping_sub(a);
      diff != 0 && diff < 0x8000
  }
@@ -5176,6 +5176,10 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +    reorder_bytes: usize,
 +    next_sequence_number: Option<u16>,
 +    requires_sync_sample: bool,
++    /// Timestamp of an access unit dropped after a loss or malformed payload.
++    /// Its remaining packets are discarded silently, so one loss produces one
++    /// discontinuity rather than one per orphaned fragment.
++    discarding_timestamp: Option<u32>,
 +    payload_assembler: PayloadAssembler,
 +    current: CurrentAccessUnit,
 +    video_parameter_set: Option<Vec<u8>>,
@@ -5209,6 +5213,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +            reorder_bytes: 0,
 +            next_sequence_number: None,
 +            requires_sync_sample: true,
++            discarding_timestamp: None,
 +            payload_assembler: PayloadAssembler::new(
 +                limits.max_nal_unit_size,
 +                limits.max_nal_unit_count,
@@ -5242,6 +5247,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +        self.reorder_bytes = 0;
 +        self.next_sequence_number = None;
 +        self.requires_sync_sample = true;
++        self.discarding_timestamp = None;
 +        self.payload_assembler.reset();
 +        self.current = CurrentAccessUnit::default();
 +        self.video_parameter_set = None;
@@ -5335,6 +5341,15 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +    }
 +
 +    fn consume_ordered(&mut self, packet: QueuedPacket) -> Vec<HevcDepacketizerEvent> {
++        if let Some(discarding) = self.discarding_timestamp {
++            if packet.timestamp == discarding {
++                if packet.marker {
++                    self.discarding_timestamp = None;
++                }
++                return Vec::new();
++            }
++            self.discarding_timestamp = None;
++        }
 +        let mut events = Vec::new();
 +        if let Some(timestamp) = self.current.timestamp
 +            && timestamp != packet.timestamp
@@ -5358,6 +5373,10 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +                events.push(HevcDepacketizerEvent::Discontinuity(discontinuity));
 +                self.drop_current_access_unit();
 +                self.requires_sync_sample = true;
++                if packet.marker {
++                    // The dropped access unit ended with this packet.
++                    self.discarding_timestamp = None;
++                }
 +                return events;
 +            }
 +        };
@@ -5369,6 +5388,9 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +                events.push(HevcDepacketizerEvent::Discontinuity(discontinuity));
 +                self.drop_current_access_unit();
 +                self.requires_sync_sample = true;
++                if packet.marker {
++                    self.discarding_timestamp = None;
++                }
 +                return events;
 +            }
 +        }
@@ -5383,6 +5405,8 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +            ));
 +            self.drop_current_access_unit();
 +            self.requires_sync_sample = true;
++            // This marker ended the dropped access unit.
++            self.discarding_timestamp = None;
 +            return events;
 +        }
 +        if let Some(event) = self.finish_access_unit() {
@@ -5504,6 +5528,7 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +    }
 +
 +    fn drop_current_access_unit(&mut self) {
++        self.discarding_timestamp = self.current.timestamp;
 +        self.payload_assembler.reset();
 +        self.current = CurrentAccessUnit::default();
 +    }
@@ -6225,6 +6250,51 @@ index f0e4dc29d5b42a3f2e8825807af104b8da071b27..7661ed449ec0e3fc0ac5b828080c9794
 +    }
 +
 +    #[test]
++    fn one_lost_fragment_reports_one_discontinuity_for_its_access_unit() {
++        let mut assembler = HevcAccessUnitAssembler::new(PAYLOAD_TYPE, SSRC);
++        synchronize(&mut assembler, 40);
++        prime_parameter_sets(&mut assembler, 41);
++
++        // A large IDR split into FUs; the packet after the first is lost.
++        let fragments = MAX_REORDER_BUFFER + 20;
++        let mut discontinuities = 0;
++        let mut count = |events: Vec<HevcDepacketizerEvent>| {
++            discontinuities += events
++                .iter()
++                .filter(|event| matches!(event, HevcDepacketizerEvent::Discontinuity(_)))
++                .count();
++        };
++        count(push(
++            &mut assembler,
++            42,
++            10,
++            false,
++            &fu(19, true, false, &[1]),
++        ));
++        for index in 2..fragments {
++            let end = index == fragments - 1;
++            count(push(
++                &mut assembler,
++                42u16.wrapping_add(index as u16),
++                10,
++                end,
++                &fu(19, false, end, &[2]),
++            ));
++        }
++        assert_eq!(discontinuities, 1, "one loss is one discontinuity");
++
++        let recovered = nal(19, &[0xdd]);
++        let output = access_units(push(
++            &mut assembler,
++            42u16.wrapping_add(fragments as u16),
++            11,
++            true,
++            &recovered,
++        ));
++        assert_eq!(output.len(), 1, "the next sync sample is decoded");
++    }
++
++    #[test]
 +    fn sequence_gap_drops_predicted_frames_until_a_fresh_sync_sample() {
 +        let mut assembler = HevcAccessUnitAssembler::new(PAYLOAD_TYPE, SSRC);
 +        synchronize(&mut assembler, 40);
@@ -6620,7 +6690,7 @@ index ba4dc2f23d58feff1dd187bd59e5048fe1623403..422a8ffec5b42ddea1132868244233b1
 -pub use rtp::RtpPacket;
 +pub use rtp::{RtpPacket, RtpParseError};
 diff --git a/idevice/src/services/core_device/display_stream/negotiation.rs b/idevice/src/services/core_device/display_stream/negotiation.rs
-index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef0c49422e 100644
+index a3eeefb28eceab61782046a2d409290c26af0a48..7e9a4e34ea428cfa8e747d8b82274a0e0e5b7564 100644
 --- a/idevice/src/services/core_device/display_stream/negotiation.rs
 +++ b/idevice/src/services/core_device/display_stream/negotiation.rs
 @@ -13,6 +13,7 @@
@@ -6773,7 +6843,7 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
 +                        match raw_payload_type {
 +                            None => saw_missing_payload_type = true,
 +                            Some(value) => match u8::try_from(value) {
-+                                Ok(value) if (1..=127).contains(&value) => {
++                                Ok(value) if is_usable_payload_type(value) => {
 +                                    saw_valid_payload_type = true;
 +                                    payload_types.push(value);
 +                                }
@@ -6868,7 +6938,7 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
 +                saw_invalid_payload_type = true;
 +                continue;
 +            };
-+            if !(1..=127).contains(&payload_type) {
++            if !is_usable_payload_type(payload_type) {
 +                saw_invalid_payload_type = true;
 +                continue;
 +            }
@@ -6996,7 +7066,21 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
      Ok(MediaNegotiationBlob::decode(blob))
  }
  
-@@ -708,4 +1026,193 @@ mod tests {
+@@ -673,6 +991,13 @@ impl EncodeDecodeFeatures {
+     }
+ }
+ 
++/// A dynamic RTP payload type that cannot be mistaken for RTCP when RTP and
++/// RTCP share a port: with the marker bit set, 64..=95 occupy the RTCP packet
++/// type range 192..=223 (RFC 5761 section 4).
++fn is_usable_payload_type(payload_type: u8) -> bool {
++    (1..=127).contains(&payload_type) && !(64..=95).contains(&payload_type)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -708,4 +1033,204 @@ mod tests {
          assert_eq!(back.stream_groups[0].payloads[0].rtp_payload, 100);
          assert_eq!(back.stream_groups[0].streams[0].rtp_ssrc, 0xdead_beef);
      }
@@ -7103,6 +7187,17 @@ index a3eeefb28eceab61782046a2d409290c26af0a48..83158841198815887b055419ba7c27ef
 +
 +        assert_eq!(stream.payload_type, 100);
 +        assert_eq!(stream.ssrc, 3);
++    }
++
++    #[test]
++    fn payload_types_that_collide_with_rtcp_are_rejected() {
++        // Same answer as above with payload type 72 instead of 100.
++        let raw = vec![0x2a, 0x08, 0x08, 0x03, 0x1a, 0x04, 0x08, 0x48, 0x20, 0x0e];
++
++        assert_eq!(
++            parse_screen_video_answer(&legacy_screen_answer(&raw)),
++            Err(ScreenVideoAnswerError::PayloadTypeInvalid)
++        );
 +    }
 +
 +    fn legacy_screen_answer(raw: &[u8]) -> Vec<u8> {
@@ -7325,15 +7420,21 @@ index 2a8818e2a36493d4608ba1ff91266ac6a5e7acc7..c946b2604e4ce313265cbdfeedbe1b3e
 +    }
  }
 diff --git a/idevice/src/services/core_device/display_stream/rtcp.rs b/idevice/src/services/core_device/display_stream/rtcp.rs
-index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff45c44882 100644
+index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..87bb0c43b13a923b28e40e0daf1fab29a921e5ca 100644
 --- a/idevice/src/services/core_device/display_stream/rtcp.rs
 +++ b/idevice/src/services/core_device/display_stream/rtcp.rs
-@@ -18,7 +18,45 @@ const FMT_PLI: u8 = 1; // Picture Loss Indication
+@@ -17,8 +17,51 @@ pub const PT_PSFB: u8 = 206;
+ const FMT_PLI: u8 = 1; // Picture Loss Indication
  const FMT_FIR: u8 = 4; // Full Intra Request
  
++/// Whether a datagram on an RTP/RTCP-multiplexed port is RTCP.
++///
++/// Classification follows RFC 5761 (second byte 192..=223), not whether the
++/// packet is one this module can parse: extended reports or RTCP with odd
++/// padding must still be kept away from the RTP parser.
  pub fn is_rtcp(buf: &[u8]) -> bool {
 -    buf.len() >= 2 && (PT_SENDER_REPORT..=PT_PSFB).contains(&buf[1])
-+    rtcp_packet_length(buf, 0).is_some()
++    buf.len() >= 4 && buf[0] >> 6 == 2 && (192..=223).contains(&buf[1])
 +}
 +
 +fn rtcp_packet_length(buf: &[u8], offset: usize) -> Option<usize> {
@@ -7375,7 +7476,7 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
  }
  
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-@@ -36,13 +74,9 @@ impl SenderReport {
+@@ -36,13 +79,9 @@ impl SenderReport {
          // minus one.
          while off + 4 <= buf.len() {
              let pt = buf[off + 1];
@@ -7391,7 +7492,7 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
                  let ssrc =
                      u32::from_be_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]);
                  let ntp_msw =
-@@ -107,7 +141,10 @@ pub fn build_sdes(our_ssrc: u32, cname: &str) -> Vec<u8> {
+@@ -107,7 +146,10 @@ pub fn build_sdes(our_ssrc: u32, cname: &str) -> Vec<u8> {
      out.extend_from_slice(&our_ssrc.to_be_bytes());
      // CNAME item: type 1, length, text.
      let bytes = cname.as_bytes();
@@ -7403,7 +7504,7 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
      out.push(1);
      out.push(len as u8);
      out.extend_from_slice(&bytes[..len]);
-@@ -254,10 +291,9 @@ mod tests {
+@@ -254,10 +296,24 @@ mod tests {
          // RTP video (PT 100), marker clear and set.
          assert!(!is_rtcp(&[0x80, 100, 0, 0]));
          assert!(!is_rtcp(&[0x80, 0x80 | 100, 0, 0]));
@@ -7414,24 +7515,51 @@ index 4d14b5f176ef0dbc72825ab6e9d9cf369716971a..42407bb78c59615acc5bd2d20dae26ff
 +        // Complete RTCP RR / PSFB framing.
 +        assert!(is_rtcp(&build_receiver_report(1, &[])));
 +        assert!(is_rtcp(&build_pli(1, 2)));
++    }
++
++    #[test]
++    fn rtcp_types_this_parser_does_not_model_are_still_rtcp() {
++        // RFC 5761: in a multiplexed stream the second byte decides. Extended
++        // reports (207) and RTCP with unusable padding must never reach the
++        // RTP parser, where they would end the session.
++        assert!(is_rtcp(&[0x80, 207, 0x00, 0x01, 0, 0, 0, 1]));
++        assert!(is_rtcp(&[0xA0, 201, 0x00, 0x01, 0, 0, 0, 0]));
++        assert!(is_rtcp(&[0x80, 192, 0x00, 0x00]));
++        assert!(is_rtcp(&[0x80, 223, 0x00, 0x00]));
++        assert!(!is_rtcp(&[0x80, 191, 0x00, 0x00]));
++        assert!(!is_rtcp(&[0x80, 224, 0x00, 0x00]));
++        assert!(!is_rtcp(&[0x40, 207, 0x00, 0x00]), "not RTP version 2");
++        assert!(!is_rtcp(&[0x80, 207]), "shorter than a header");
      }
  
      #[test]
-@@ -372,4 +408,73 @@ mod tests {
+@@ -372,4 +428,85 @@ mod tests {
          // Middle 32 bits = low16(msw) << 16 | high16(lsw).
          assert_eq!(parsed.ntp_middle, 0x2222_3333);
      }
 +
 +    #[test]
 +    fn framing_checks_reject_wrong_version_truncation_and_impossible_lengths() {
++        // Classification only rejects non-version-2 packets; framing checks
++        // guard the parsers that read RTCP bodies.
 +        assert!(!is_rtcp(&[0x00, PT_SENDER_REPORT, 0, 0]));
-+        assert!(!is_rtcp(&[0x80, PT_SENDER_REPORT, 0, 6]));
-+        assert!(!is_rtcp(&[0x80, PT_RECEIVER_REPORT, 0, 0]));
-+        assert!(!is_rtcp(&[0x80, PT_APP, 0, 1, 0, 0, 0, 1]));
-+        assert!(!is_rtcp(&[0x80, 199, 0, 0]));
++        for truncated_or_impossible in [
++            &[0x80, PT_SENDER_REPORT, 0, 6][..],
++            &[0x80, PT_RECEIVER_REPORT, 0, 0][..],
++            &[0x80, PT_APP, 0, 1, 0, 0, 0, 1][..],
++            &[0x80, 199, 0, 0][..],
++        ] {
++            assert!(is_rtcp(truncated_or_impossible));
++            assert!(rtcp_packet_length(truncated_or_impossible, 0).is_none());
++        }
 +
-+        assert!(is_rtcp(&build_receiver_report(1, &[])));
-+        assert!(is_rtcp(&build_pli(1, 2)));
++        let receiver_report = build_receiver_report(1, &[]);
++        assert_eq!(
++            rtcp_packet_length(&receiver_report, 0),
++            Some(receiver_report.len())
++        );
++        let pli = build_pli(1, 2);
++        assert_eq!(rtcp_packet_length(&pli, 0), Some(pli.len()));
 +    }
 +
 +    #[test]

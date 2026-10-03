@@ -13,25 +13,16 @@ if [[ -z "${CI:-}" && "${DEVICE_HUB_FULL_CI:-0}" != "1" ]]; then
   fi
 fi
 
-# Acquire the shared simulator before the process guard. The simulator
-# supervisor re-executes this script and cannot preserve the guard's private
-# file descriptor across that boundary.
-if [[ -z "${CODEX_SIMULATOR_LEASE_ID:-}" ]] \
-  && command -v codex-simulator-lease >/dev/null 2>&1; then
-  exec "$(command -v codex-simulator-lease)" run \
-    --name device-hub-full-ci \
-    --timeout-seconds 3600 \
-    -- "$0" "$@"
-fi
+SIMULATOR_GUARD="$ROOT/BuildSupport/simulator_guard.sh"
+# shellcheck source=BuildSupport/simulator_guard.sh
+source "$SIMULATOR_GUARD"
+devicehub_enter_simulator_lease device-hub-full-ci 3600 "$0" "$@"
 
 PROCESS_GUARD="$ROOT/BuildSupport/process_guard.sh"
 # shellcheck source=BuildSupport/process_guard.sh
 source "$PROCESS_GUARD"
 devicehub_require_guard full-ci 3600 "$0" "$@"
 
-SIMULATOR_GUARD="$ROOT/BuildSupport/simulator_guard.sh"
-# shellcheck source=BuildSupport/simulator_guard.sh
-source "$SIMULATOR_GUARD"
 devicehub_require_simulator device-hub-full-ci 3600 "$0" "$@"
 
 RELEASE_DERIVED_DATA_PATH=""
@@ -43,7 +34,7 @@ cleanup() {
   if ! devicehub_cleanup_simulator; then
     status=125
   fi
-  return "$status"
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -62,6 +53,17 @@ run_ci_task() {
     mise run "$@"
 }
 
+# Verification must not rewrite the checkout (formatting, recorded snapshots,
+# regenerated artifacts). Compare against the state CI started from so local
+# uncommitted work is allowed but any change made by a gate fails the run.
+checkout_state() {
+  {
+    git status --porcelain=v1 --untracked-files=all
+    git diff HEAD
+  } | shasum -a 256
+}
+CHECKOUT_BEFORE="$(checkout_state)"
+
 run_ci_task test
 run_ci_task protocol:verify
 run_ci_task lint
@@ -71,5 +73,11 @@ CONFIGURATION=Release \
 CODE_SIGNING_ALLOWED=NO \
 DERIVED_DATA_PATH="$RELEASE_DERIVED_DATA_PATH" \
   run_ci_task build
+
+if [[ "$(checkout_state)" != "$CHECKOUT_BEFORE" ]]; then
+  git status --short >&2
+  printf 'Verification changed the checkout.\n' >&2
+  exit 1
+fi
 
 printf 'Device Hub CI passed.\n'

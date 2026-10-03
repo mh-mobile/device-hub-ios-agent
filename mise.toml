@@ -88,7 +88,7 @@ run = [
 
 [tasks."format:check"]
 description = "Check Swift formatting"
-run = "swiftformat Packages Sources Tools --config .swiftformat --lint"
+run = "swiftformat Packages Sources Tests Tools --config .swiftformat --lint"
 
 [tasks."lint:swift"]
 description = "Lint Swift source"
@@ -130,10 +130,17 @@ sources = [
   "Rust/Cargo.lock",
   "Rust/Cargo.toml",
   "Rust/DeviceHubFFI/**/*.rs",
+  "Rust/DeviceHubFFI/Cargo.toml",
   "Rust/DeviceHubFFI/include/*",
+  "Scripts/build-protocol-xcframework.sh",
   "Vendor/patches/idevice-device-hub.patch",
+  "mise.toml",
 ]
 outputs = ["Rust/Artifacts/DeviceHubFFI.xcframework/Info.plist"]
+
+[tasks."protocol:patch"]
+description = "Rewrite the idevice patch and digests from edits in Vendor/idevice"
+run = "python3 BuildSupport/regenerate_idevice_patch.py"
 
 [tasks."protocol:bootstrap"]
 description = "Fetch and patch the pinned idevice dependency"

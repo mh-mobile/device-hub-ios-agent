@@ -2,8 +2,7 @@
 
 ![Device Hub iOS running on iPad and controlling an iPhone](Docs/Images/device-hub-ipad.png)
 
-[![CI](https://github.com/JaviSoto/device-hub-ios/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/JaviSoto/device-hub-ios/actions/workflows/ci.yml)
-![iOS and iPadOS 27+](https://img.shields.io/badge/iOS%20%26%20iPadOS-27%2B-000000?logo=apple&logoColor=white)
+![iOS and iPadOS 26+](https://img.shields.io/badge/iOS%20%26%20iPadOS-26%2B-000000?logo=apple&logoColor=white)
 ![Swift 6.4](https://img.shields.io/badge/Swift-6.4-F05138?logo=swift&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
 
@@ -73,6 +72,32 @@ Available tasks:
 | `mise run ci` | Run the appropriate local verification suite for the current changes |
 
 Run `mise tasks` for the full task list.
+
+## Agent HTTP API
+
+This fork can let an agent on another machine drive the device shown in Device
+Hub over HTTP on port 8765 (`/screen`, `/screenshot`, `/tap`, `/drag`, `/type`,
+`/button`). It is off by default. To enable it, set a token of at least 16
+characters in `Config/Local.xcconfig`:
+
+```
+DEVICE_HUB_AGENT_TOKEN = <output of: openssl rand -hex 24>
+```
+
+Requests must come from loopback or a Tailscale address (100.64.0.0/10,
+fd7a:115c:a1e0::/48) and send `Authorization: Bearer <token>`. Connections from
+other sources are closed without a response, and missing or wrong tokens get 401. `Tools/agent-mcp/device_hub_mcp.py` is a
+stdio MCP server for it; it requires `DEVICE_HUB_URL` (the iPad's full tailnet
+name) and `DEVICE_HUB_AGENT_TOKEN`, ignores proxy settings, and does not follow
+redirects, so the token reaches only that URL.
+
+Two limits to keep in mind:
+
+- 100.64.0.0/10 is also the carrier-grade NAT range. On a network that uses it
+  internally, its devices pass the source check, and only the token protects
+  the API.
+- The token is built into the app's Info.plist in plain text. Anyone with the
+  built app can read it, so never set it in a build you give to others.
 
 ## Project structure
 

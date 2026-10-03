@@ -177,7 +177,9 @@ struct RemoteSessionFeatureTests {
 
         await store.send(.rotateRightButtonTapped)
         await store.send(
-            .tap(
+            .touch(
+                contactID: 0,
+                phase: .began,
                 point: Point2D(x: 50, y: 100),
                 viewport: Viewport(
                     origin: Point2D(x: 0, y: 0),
@@ -237,26 +239,44 @@ struct RemoteSessionFeatureTests {
         await store.receive(\.commandFinished)
         #expect(store.state.session?.frame?.metadata.orientation == .portrait)
 
-        await store.send(
-            .tap(
-                point: Point2D(x: 150, y: 100),
-                viewport: Viewport(
-                    origin: Point2D(x: 0, y: 0),
-                    size: Size2D(width: 200, height: 400)
-                )
-            )
+        let viewport = Viewport(
+            origin: Point2D(x: 0, y: 0),
+            size: Size2D(width: 200, height: 400)
         )
+        await store.send(
+            .touch(
+                contactID: 0,
+                phase: .began,
+                point: Point2D(x: 150, y: 100),
+                viewport: viewport
+            )
+        ) {
+            $0.activeContactIDs = [0]
+        }
         await recorder.waitForCommandCount(2)
-        let commandsAfterTap = await recorder.commands()
-        #expect(commandsAfterTap.count == 2)
+        await store.receive(\.commandFinished)
+        await store.send(
+            .touch(
+                contactID: 0,
+                phase: .ended,
+                point: Point2D(x: 150, y: 100),
+                viewport: viewport
+            )
+        ) {
+            $0.activeContactIDs = []
+        }
+        await recorder.waitForCommandCount(3)
+        await store.receive(\.commandFinished)
+        let point = TargetPixelPoint(x: 74.25, y: 49.75)
+        let recordedCommands = await recorder.commands()
         expectNoDifference(
-            commandsAfterTap,
+            recordedCommands,
             [
-                .rotation(.rotateRight),
-                .tap(TargetPixelPoint(x: 74.25, y: 49.75))
+                DeviceCommand.rotation(.rotateRight),
+                .touch(TouchCommand(contactID: 0, point: point, phase: .began)),
+                .touch(TouchCommand(contactID: 0, point: point, phase: .ended))
             ]
         )
-        await store.receive(\.commandFinished)
 
         await store.send(.stopViewingButtonTapped) {
             $0.isViewingStopped = true
@@ -275,15 +295,6 @@ struct RemoteSessionFeatureTests {
             device: device,
             receivedAt: time
         )
-        let store = TestStore(
-            initialState: RemoteSessionFeature.State(
-                roster: DeviceRoster(devices: [device]),
-                selectedDeviceID: device.id,
-                session: current
-            )
-        ) {
-            RemoteSessionFeature()
-        }
         let sessionID = try #require(current.sessionID)
         let errors: [DeviceHubError] = [
             .localNetworkDenied,
@@ -297,6 +308,17 @@ struct RemoteSessionFeatureTests {
         ]
 
         for error in errors {
+            let store = TestStore(
+                initialState: RemoteSessionFeature.State(
+                    roster: DeviceRoster(devices: [device]),
+                    selectedDeviceID: device.id,
+                    session: current
+                )
+            ) {
+                RemoteSessionFeature()
+            } withDependencies: {
+                $0.continuousClock = TestClock()
+            }
             await store.send(
                 .sessionStreamFailed(
                     attemptID: current.attemptID,
@@ -306,8 +328,61 @@ struct RemoteSessionFeatureTests {
             ) {
                 $0.remediation = DeviceHubRemediation(error: error)
                 $0.session?.connectionError = error
+                $0.session?.sessionID = nil
+            }
+            if error.retryability == .automatic {
+                await store.skipInFlightEffects()
             }
         }
+    }
+
+    @Test("A frame that arrives after the session failed cannot clear the failure")
+    func lateFrameAfterFailureIsIgnored() async throws {
+        let time = Date(timeIntervalSince1970: 5100)
+        let device = device(id: "device", name: "Test iPhone")
+        let current = try connectedSession(
+            device: device,
+            receivedAt: time
+        )
+        let sessionID = try #require(current.sessionID)
+        let generation = try #require(current.remoteState?.generation)
+        let store = TestStore(
+            initialState: RemoteSessionFeature.State(
+                roster: DeviceRoster(devices: [device]),
+                selectedDeviceID: device.id,
+                session: current
+            )
+        ) {
+            RemoteSessionFeature()
+        } withDependencies: {
+            $0.continuousClock = TestClock()
+            $0.date.now = time
+        }
+
+        await store.send(
+            .sessionStreamFailed(
+                attemptID: current.attemptID,
+                sessionID: sessionID,
+                error: .connectionLost
+            )
+        ) {
+            $0.remediation = DeviceHubRemediation(error: .connectionLost)
+            $0.session?.connectionError = .connectionLost
+            $0.session?.sessionID = nil
+        }
+        try await store.send(
+            .frameReceived(
+                attemptID: current.attemptID,
+                sessionID: sessionID,
+                frame: remoteFrame(
+                    generation: generation,
+                    receivedAt: time,
+                    sequenceNumber: 2
+                )
+            )
+        )
+        #expect(!store.state.acceptsInput)
+        await store.skipInFlightEffects()
     }
 
     @Test("Backgrounding clears pixels, pairing codes, and held input")

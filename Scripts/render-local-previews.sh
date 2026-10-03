@@ -96,11 +96,11 @@ if [[ -n "${PREVIEW_SCRATCH_PATH:-}" ]]; then
   SWIFT_RUN_ARGUMENTS+=(--scratch-path "$PREVIEW_SCRATCH_PATH")
 fi
 
-swift test "${SWIFT_RUN_ARGUMENTS[@]}"
-swift run "${SWIFT_RUN_ARGUMENTS[@]}" \
+xcrun swift test "${SWIFT_RUN_ARGUMENTS[@]}"
+xcrun swift run "${SWIFT_RUN_ARGUMENTS[@]}" \
   "$RENDERER_PRODUCT" \
   --output "$STAGING_DIR"
-swift run "${SWIFT_RUN_ARGUMENTS[@]}" \
+xcrun swift run "${SWIFT_RUN_ARGUMENTS[@]}" \
   "$RENDERER_PRODUCT" \
   --list-json \
   --output "$STAGING_DIR" > "$STAGING_DIR/renderer-catalog.json"

@@ -166,6 +166,7 @@ public struct NativeSessionFailure:
         "input_delivery_failed",
         "input_service_connect_failed",
         "media_callback_unavailable",
+        "media_stalled",
         "media_sequence_exhausted",
         "orientation_service_connect_failed",
         "orientation_query_failed",
@@ -211,7 +212,8 @@ public struct NativeSessionFailure:
         "video_negotiation_timeout",
         "video_receiver_rejected",
         "video_stream_failed",
-        "video_stream_receive_failed"
+        "video_stream_receive_failed",
+        "video_stream_start_timed_out"
     ]
 
     private static let allowedStages: Set<String> = [
@@ -629,8 +631,10 @@ enum NativeSessionValidation {
             !value.isEmpty,
             value == value.trimmingCharacters(in: .whitespacesAndNewlines),
             value.utf8.count <= maximumUTF8Length,
+            // Only C0/C1 controls (Cc), as in Rust: format characters
+            // such as the ZWJ in emoji names are valid display text.
             value.unicodeScalars.allSatisfy({
-                !CharacterSet.controlCharacters.contains($0)
+                $0.properties.generalCategory != .control
             })
         else {
             throw NativeSessionContractError.invalidText

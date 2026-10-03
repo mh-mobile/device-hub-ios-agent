@@ -2,7 +2,7 @@
 import Testing
 
 @Suite("Pairing persistence provisioning")
-struct DeviceHubPairingPersistenceProvisioningTests {
+struct PairingPersistenceProvisioningTests {
     @Test("a configured Keychain service is preserved exactly")
     func configuredService() throws {
         #expect(
