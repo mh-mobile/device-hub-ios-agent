@@ -43,6 +43,42 @@ done
 temporary_directory="$(mktemp -d)"
 trap 'rm -rf "$temporary_directory"' EXIT
 
+# Prints each object in a static library built for another platform, or for
+# a newer OS than the slice promises. Older minimums (prebuilt standard
+# library objects) are fine. The smoke executable below cannot catch this:
+# its own minimum comes from the flag passed to clang.
+#
+# Older objects use LC_VERSION_MIN_IPHONEOS for both device and simulator
+# (there is no simulator-specific command); LC_BUILD_VERSION carries the
+# platform (2 device, 7 simulator).
+library_version_violations() {
+  local library="$1"
+  local build_platform="$2"
+  local maximum="$3"
+  /usr/bin/otool -l "$library" | awk \
+    -v platform="$build_platform" \
+    -v maximum="$maximum" '
+    function number(version, parts) {
+      split(version, parts, ".")
+      return parts[1] * 10000 + parts[2] * 100 + parts[3]
+    }
+    /^[^ ].*\.o\)?:$/ { object = substr($0, 1, length($0) - 1) }
+    $1 == "cmd" { command = $2; next }
+    command == "LC_BUILD_VERSION" && $1 == "platform" && $2 != platform {
+      print object ": platform " $2
+    }
+    command == "LC_BUILD_VERSION" && $1 == "minos" && number($2) > number(maximum) {
+      print object ": minos " $2
+    }
+    command ~ /^LC_VERSION_MIN_/ && command != "LC_VERSION_MIN_IPHONEOS" && $1 == "version" {
+      print object ": " command
+    }
+    command == "LC_VERSION_MIN_IPHONEOS" && $1 == "version" && number($2) > number(maximum) {
+      print object ": version " $2
+    }
+  '
+}
+
 verify_slice() {
   local sdk="$1"
   local minimum_flag="$2"
@@ -63,6 +99,15 @@ verify_slice() {
 
   if ! file "$executable" | rg -q 'Mach-O 64-bit executable arm64'; then
     echo "error: $sdk smoke executable is not arm64 Mach-O" >&2
+    exit 1
+  fi
+
+  local violations
+  violations="$(library_version_violations \
+    "$library" "$expected_platform" "$EXPECTED_MINIMUM")"
+  if [[ -n "$violations" ]]; then
+    echo "error: $sdk library has objects for another platform or a newer OS:" >&2
+    echo "$violations" >&2
     exit 1
   fi
 
