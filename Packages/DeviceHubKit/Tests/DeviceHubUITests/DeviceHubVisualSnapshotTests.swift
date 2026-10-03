@@ -60,6 +60,8 @@
         case sessionEndedIPhoneDark
         case sessionEndedRemediationIPhoneDark
         case sessionEndedRemediationIPadDark
+        case reconnectExhaustedIPhoneDark
+        case reconnectExhaustedIPadDark
         case lockedIPhoneAccessibility
         case developerModeIPadAccessibility
         case localNetworkDeniedIPadDark
@@ -250,7 +252,9 @@
 
             case .sessionEndedIPhoneDark,
                  .sessionEndedRemediationIPhoneDark,
-                 .sessionEndedRemediationIPadDark:
+                 .sessionEndedRemediationIPadDark,
+                 .reconnectExhaustedIPhoneDark,
+                 .reconnectExhaustedIPadDark:
                 // Dismissed remediation: the canvas must still offer a way
                 // back instead of an endless spinner. Open remediation: only
                 // the panel shows, not a second Reconnect message behind it.
@@ -264,6 +268,8 @@
                     remediation: scenario == .sessionEndedIPhoneDark
                         ? nil
                         : DeviceHubRemediation(error: .connectionLost),
+                    reconnectAttempts: scenario.exhaustsReconnects
+                        ? RemoteSessionFeature.maximumReconnectAttempts : 0,
                     roster: roster,
                     selectedDeviceID: reachableDevice.id,
                     session: session
