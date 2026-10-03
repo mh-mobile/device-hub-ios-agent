@@ -73,11 +73,16 @@ extension RemoteSessionFeature {
             else {
                 return .none
             }
-            state.reconnectAttempts += 1
-            return beginSessionIfPossible(
+            let begin = beginSessionIfPossible(
                 state: &state,
                 device: device
             )
+            // Only a reconnect that actually starts connecting counts; an
+            // unreachable device is picked up again by its next snapshot.
+            if state.session != nil {
+                state.reconnectAttempts += 1
+            }
+            return begin
 
         case .retrySelectedDevice:
             guard let device = state.selectedDevice else {
@@ -179,6 +184,7 @@ extension RemoteSessionFeature {
         )
         if state.selectedDeviceID != previousSelection {
             state.isViewingStopped = false
+            state.reconnectAttempts = 0
         }
 
         let deviceUpdate = updateActiveDevice(state: &state)
