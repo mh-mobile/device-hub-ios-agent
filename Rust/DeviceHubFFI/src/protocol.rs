@@ -53,9 +53,10 @@ use crate::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const PAIR_SETUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-// A peer that connects must start pairing promptly; a silent connection is
-// dropped so it cannot hold the one pairing slot for PAIR_SETUP_TIMEOUT.
-const PAIRING_FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+// A peer that connects must deliver its first pairing frame promptly; anything
+// slower is dropped so it cannot hold the one pairing slot for
+// PAIR_SETUP_TIMEOUT.
+const PAIRING_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 const RSD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -184,7 +185,7 @@ async fn run_pairing(
         DhSessionState::Running,
     )?;
 
-    let stream = accept_pairing_peer(&listener, PAIRING_FIRST_MESSAGE_TIMEOUT).await?;
+    let stream = accept_pairing_peer(&listener, PAIRING_FIRST_FRAME_TIMEOUT).await?;
     emitter.phase(DhConnectionPhase::Pairing, DhSessionState::Running)?;
 
     let mut pairing_file = operation.controller.pairing_file(None);
@@ -2589,13 +2590,15 @@ fn pair_verify_failure(error: IdeviceError) -> PublicFailure {
     )
 }
 
-/// Accepts the first connection that starts talking within
-/// `first_message_timeout`. A connection that stays silent, or closes, is
-/// dropped and the next one is accepted, so a stray client cannot hold the
-/// only pairing slot until Pair Setup times out.
+/// Accepts the first connection that delivers a whole RPPairing frame
+/// within `first_frame_timeout`. A connection that stays silent, trickles
+/// bytes, speaks another protocol, or closes is dropped and the next one is
+/// accepted, so a stray or hostile client cannot hold the only pairing slot
+/// until Pair Setup times out. The frame is only peeked, so Pair Setup still
+/// reads it.
 async fn accept_pairing_peer(
     listener: &TcpListener,
-    first_message_timeout: Duration,
+    first_frame_timeout: Duration,
 ) -> Result<tokio::net::TcpStream, PublicFailure> {
     loop {
         let (stream, _) = listener.accept().await.map_err(|_| {
@@ -2606,12 +2609,43 @@ async fn accept_pairing_peer(
                 "Unable to accept the device pairing connection.",
             )
         })?;
-        let mut first_byte = [0u8; 1];
-        if let Ok(Ok(1..)) =
-            tokio::time::timeout(first_message_timeout, stream.peek(&mut first_byte)).await
+        if let Ok(true) =
+            tokio::time::timeout(first_frame_timeout, first_frame_arrives(&stream)).await
         {
             return Ok(stream);
         }
+    }
+}
+
+/// Waits, without consuming anything, until `stream` holds a complete first
+/// RPPairing frame (magic, big-endian length, body). False if the peer sends
+/// something else or closes first.
+async fn first_frame_arrives(stream: &tokio::net::TcpStream) -> bool {
+    const MAGIC: &[u8] = b"RPPairing";
+    let header_len = MAGIC.len() + 2;
+    let mut buffer = vec![0u8; header_len + usize::from(u16::MAX)];
+    loop {
+        let Ok(available) = stream.peek(&mut buffer).await else {
+            return false;
+        };
+        if available == 0
+            || !buffer[..available.min(MAGIC.len())]
+                .starts_with(&MAGIC[..available.min(MAGIC.len())])
+        {
+            return false;
+        }
+        if available >= header_len {
+            let body_len = usize::from(u16::from_be_bytes([
+                buffer[MAGIC.len()],
+                buffer[MAGIC.len() + 1],
+            ]));
+            if available >= header_len + body_len {
+                return true;
+            }
+        }
+        // Part of the frame is here; peek returns at once while any byte is
+        // buffered, so wait a little for the rest instead of spinning.
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -3712,29 +3746,44 @@ mod tests {
         assert_eq!(answered.ok(), Some(Some(3)));
     }
 
+    /// One RPPairing frame: magic, big-endian length, then the JSON body.
+    fn rppairing_frame(body: &[u8]) -> Vec<u8> {
+        let mut frame = b"RPPairing".to_vec();
+        frame.extend_from_slice(&u16::try_from(body.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
     #[tokio::test]
-    async fn a_silent_pairing_connection_does_not_hold_the_listener() {
+    async fn only_a_peer_that_sends_a_whole_first_frame_gets_the_pairing_slot() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        // Silent; one byte then stalls (slowloris); the wrong protocol.
         let _silent = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut trickle = tokio::net::TcpStream::connect(address).await.unwrap();
+        trickle.write_all(b"R").await.unwrap();
+        let mut stranger = tokio::net::TcpStream::connect(address).await.unwrap();
+        stranger.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
         let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
-        peer.write_all(b"RPPairing").await.unwrap();
+        let frame = rppairing_frame(b"{}");
+        peer.write_all(&frame).await.unwrap();
 
         let mut accepted = tokio::time::timeout(
             Duration::from_secs(5),
             accept_pairing_peer(&listener, Duration::from_millis(100)),
         )
         .await
-        .expect("the real peer is accepted after the silent one times out")
+        .expect("the real peer is accepted once the others are dropped")
         .unwrap();
 
-        let mut first = [0u8; 9];
+        // Nothing was consumed: Pair Setup still reads the whole frame.
+        let mut first = vec![0u8; frame.len()];
         tokio::time::timeout(Duration::from_secs(5), accepted.read_exact(&mut first))
             .await
-            .expect("the accepted connection is the one that sent data")
+            .expect("the accepted connection is the one that sent the frame")
             .unwrap();
-        assert_eq!(&first, b"RPPairing");
+        assert_eq!(first, frame);
     }
 
     #[tokio::test]
