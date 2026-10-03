@@ -20,9 +20,9 @@ from pathlib import Path
 IDEVICE_REPOSITORY = "https://github.com/jkcoxson/idevice.git"
 IDEVICE_REVISION = "a64b8867815b3da17b5c927531bdba877e8456ef"
 IDEVICE_PATCH_SHA256 = (
-    "f3b6fa8e32162e0a0cda5cf46244b4c6cadc772b512aa0daf29e07dce9823b4d"
+    "d426f42d6b9bac01ef4ff19a8da248c8cdffdfb4ea5a9268ab11561760159a5b"
 )
-IDEVICE_TREE_SHA256 = "c523a05b75ee85be508c71418faa4d611f1f73f0bc5e92be265f0f762b2c1650"
+IDEVICE_TREE_SHA256 = "cc84ccc3b2427f74e3d2eaf3f90bee5dec1c2ceb1c1130a796369fc3acd10709"
 
 
 class BootstrapError(RuntimeError):
