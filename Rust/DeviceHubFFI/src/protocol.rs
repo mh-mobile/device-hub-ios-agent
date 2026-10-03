@@ -73,8 +73,12 @@ const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 // Refreshing orientation on a sync sample blocks the receive loop; keep it short.
 const ORIENTATION_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
-// Below MEDIA_STALL_TIMEOUT: the query runs inside the video branch.
+// Lock wait plus answer wait stays below MEDIA_STALL_TIMEOUT on both paths:
+// the query runs inside the video branch.
 const ORIENTATION_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+// A new configuration needs the orientation, so it waits longer for a
+// rotation to release the client than a sync access unit does.
+const ORIENTATION_CONFIGURATION_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 // The device keeps sending RTCP sender reports while the screen is static, so a
 // silent video socket means the path is gone (airplane mode, lost access point).
 // Without this the session stayed "Live" until the kernel's TCP timeout.
@@ -1198,6 +1202,24 @@ async fn refresh_orientation<C, T, E>(
     }
 }
 
+/// Reads the orientation a new video configuration needs; any failure ends
+/// the session. Like `refresh_orientation`, the lock and answer waits are
+/// bounded separately so their sum stays below the stall timeout.
+async fn read_orientation<C, T, E>(
+    client: &tokio::sync::Mutex<C>,
+    lock_timeout: Duration,
+    answer_timeout: Duration,
+    query: impl AsyncFnOnce(&mut C) -> Result<T, E>,
+) -> Result<T, PublicFailure> {
+    let mut client = tokio::time::timeout(lock_timeout, client.lock())
+        .await
+        .map_err(|_| orientation_state_failed())?;
+    match tokio::time::timeout(answer_timeout, query(&mut client)).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(_)) | Err(_) => Err(orientation_state_failed()),
+    }
+}
+
 trait HardwareButtonSink {
     async fn send(&mut self, button: HardwareButton, state: ButtonState) -> Result<(), HidError>;
 }
@@ -1653,9 +1675,12 @@ async fn process_live_video_datagram(
     let authoritative_orientation =
         if prepared.has_new_configuration(video.last_configuration_revision) {
             Some(
-                stage(INPUT_TIMEOUT, orientation_state_failed(), async {
-                    orientation.lock().await.current_orientation().await
-                })
+                read_orientation(
+                    orientation,
+                    ORIENTATION_CONFIGURATION_LOCK_TIMEOUT,
+                    ORIENTATION_ANSWER_TIMEOUT,
+                    async |client| client.current_orientation().await,
+                )
                 .await?,
             )
         } else if prepared.has_sync_access_unit() {
@@ -3554,7 +3579,45 @@ mod tests {
         // The query runs inside the video branch; a wait as long as the
         // stall timeout would let the next feedback tick end a healthy
         // stream as stalled before the queued datagrams are read.
-        assert!(ORIENTATION_ANSWER_TIMEOUT < MEDIA_STALL_TIMEOUT);
+        assert!(ORIENTATION_REFRESH_TIMEOUT + ORIENTATION_ANSWER_TIMEOUT < MEDIA_STALL_TIMEOUT);
+        assert!(
+            ORIENTATION_CONFIGURATION_LOCK_TIMEOUT + ORIENTATION_ANSWER_TIMEOUT
+                < MEDIA_STALL_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_orientation_read_fails_instead_of_waiting_out_a_held_client() {
+        let client = tokio::sync::Mutex::new(());
+        let _rotation = client.lock().await;
+
+        let read = read_orientation(
+            &client,
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(1),
+        )
+        .await;
+
+        assert_eq!(
+            read.err().map(|failure| failure.code),
+            Some(orientation_state_failed().code)
+        );
+    }
+
+    #[tokio::test]
+    async fn configuration_orientation_read_returns_the_answer() {
+        let client = tokio::sync::Mutex::new(());
+
+        let read = read_orientation(
+            &client,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            async |_: &mut ()| Ok::<_, ()>(2),
+        )
+        .await;
+
+        assert_eq!(read.ok(), Some(2));
     }
 
     #[tokio::test]
