@@ -213,11 +213,12 @@ func verifyRemotePairingCandidate(
                 """
             )
             // A transport failure says nothing about identity; verify again.
-            if failure.retryable {
-                return .unreachable
-            }
+            return failure.retryable ? .unreachable : .rejected
         }
-        return .rejected
+        // Stored pairing data that cannot form a request will not change by
+        // retrying. Anything else (the keychain while the device is locked)
+        // says nothing about identity either.
+        return error is NativeSessionContractError ? .rejected : .unreachable
     }
 }
 
