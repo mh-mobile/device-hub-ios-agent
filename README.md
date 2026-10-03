@@ -43,8 +43,8 @@ The Xcode project is generated with
 workflows are managed by [mise](https://mise.jdx.dev/).
 
 ```sh
-git clone https://github.com/JaviSoto/device-hub-ios.git
-cd device-hub-ios
+git clone https://github.com/mh-mobile/device-hub-ios-agent.git
+cd device-hub-ios-agent
 mise trust
 mise install
 mise run setup
