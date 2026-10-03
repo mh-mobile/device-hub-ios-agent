@@ -73,6 +73,8 @@ const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 // Refreshing orientation on a sync sample blocks the receive loop; keep it short.
 const ORIENTATION_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
+// Below MEDIA_STALL_TIMEOUT: the query runs inside the video branch.
+const ORIENTATION_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 // The device keeps sending RTCP sender reports while the screen is static, so a
 // silent video socket means the path is gone (airplane mode, lost access point).
 // Without this the session stayed "Live" until the kernel's TCP timeout.
@@ -669,14 +671,14 @@ async fn run_control_stream(
         // that holds it.
         let (input_commands, input_receiver) = tokio::sync::mpsc::unbounded_channel();
         let input_stopping = Arc::new(AtomicBool::new(false));
-        let mut input_task = tokio::spawn(run_input_loop(
+        let mut input_task = AbortOnDrop(tokio::spawn(run_input_loop(
             input_receiver,
             Arc::clone(&input_stopping),
             universal_hid,
             keyboard_service_id,
             indigo_hid,
             Arc::clone(&orientation),
-        ));
+        )));
         let mut input_finished = false;
         controls.enable_input();
         emitter.input_ready()?;
@@ -759,7 +761,7 @@ async fn run_control_stream(
                         }
                     }
                 }
-                result = &mut input_task, if !input_finished => {
+                result = &mut input_task.0, if !input_finished => {
                     input_finished = true;
                     break Err(match result {
                         Ok(Err(failure)) => failure,
@@ -864,11 +866,11 @@ async fn run_control_stream(
         input_stopping.store(true, Ordering::Release);
         drop(input_commands);
         if !input_finished
-            && tokio::time::timeout(INPUT_TIMEOUT + INPUT_CLEANUP_TIMEOUT, &mut input_task)
+            && tokio::time::timeout(INPUT_TIMEOUT + INPUT_CLEANUP_TIMEOUT, &mut input_task.0)
                 .await
                 .is_err()
         {
-            input_task.abort();
+            input_task.0.abort();
         }
         result
     }
@@ -1162,6 +1164,16 @@ async fn handle_keyboard_intent_with_sink(
         }
     }
     Ok(())
+}
+
+/// Aborts the task when dropped, so an early return from the stream never
+/// leaves the input task holding the HID clients.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Reads the orientation for a sync access unit, best effort.
@@ -1650,7 +1662,7 @@ async fn process_live_video_datagram(
             refresh_orientation(
                 orientation,
                 ORIENTATION_REFRESH_TIMEOUT,
-                INPUT_TIMEOUT,
+                ORIENTATION_ANSWER_TIMEOUT,
                 async |client| client.current_orientation().await,
             )
             .await?
@@ -3535,6 +3547,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![DhEventKind::VideoAccessUnit]
         );
+    }
+
+    #[test]
+    fn orientation_answer_wait_ends_before_the_stall_check_fires() {
+        // The query runs inside the video branch; a wait as long as the
+        // stall timeout would let the next feedback tick end a healthy
+        // stream as stalled before the queued datagrams are read.
+        assert!(ORIENTATION_ANSWER_TIMEOUT < MEDIA_STALL_TIMEOUT);
     }
 
     #[tokio::test]
