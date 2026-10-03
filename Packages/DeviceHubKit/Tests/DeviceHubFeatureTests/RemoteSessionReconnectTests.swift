@@ -177,4 +177,51 @@ struct RemoteSessionReconnectTests {
 
         #expect(connects.value == (reconnects ? 1 : 0), "\(error)")
     }
+
+    @Test("only a video frame starts the reconnect count over, not a screenshot")
+    func screenshotDoesNotResetReconnectBudget() async throws {
+        let time = Date(timeIntervalSince1970: 6500)
+        let device = device(id: "device", name: "Test iPhone")
+        var current = try connectedSession(device: device, receivedAt: time)
+        let sessionID = try #require(current.sessionID)
+        let generation = try #require(current.remoteState?.generation)
+        // A reconnect that has just come up: ready, but nothing on screen yet.
+        var fresh = RemoteSessionState(deviceID: device.id, generation: generation)
+        _ = fresh.apply(SessionUpdate(generation: generation, event: .phaseChanged(.ready)))
+        current.frame = nil
+        current.remoteState = fresh
+        let store = TestStore(
+            initialState: RemoteSessionFeature.State(
+                reconnectAttempts: 3,
+                roster: DeviceRoster(devices: [device]),
+                selectedDeviceID: device.id,
+                session: current
+            )
+        ) {
+            RemoteSessionFeature()
+        } withDependencies: {
+            $0.continuousClock = TestClock()
+            $0.date.now = time
+        }
+        store.exhaustivity = .off
+        let video = try remoteFrame(generation: generation, receivedAt: time, sequenceNumber: 2)
+        // Every reconnect takes a screenshot before video starts, so a
+        // screenshot must not refill the budget while video keeps failing.
+        let screenshot = RemoteDisplayFrame(
+            metadata: .screenshot(ScreenshotMetadata(
+                generation: generation,
+                receivedAt: time,
+                pixelSize: PixelSize(width: 2, height: 2),
+                orientation: .portrait
+            )),
+            image: video.image
+        )
+
+        await store.send(.frameReceived(attemptID: current.attemptID, sessionID: sessionID, frame: screenshot))
+        #expect(store.state.session?.frame?.metadata.kind == .screenshot)
+        #expect(store.state.reconnectAttempts == 3)
+
+        await store.send(.frameReceived(attemptID: current.attemptID, sessionID: sessionID, frame: video))
+        #expect(store.state.reconnectAttempts == 0)
+    }
 }

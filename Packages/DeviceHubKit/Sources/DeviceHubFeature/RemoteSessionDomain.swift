@@ -30,7 +30,7 @@ public extension RemoteSessionFeature {
         public var remediation: DeviceHubRemediation?
         /// Canonical sorted roster of known paired devices.
         public var roster: DeviceRoster
-        /// Automatic reconnects since the last live frame or user retry.
+        /// Automatic reconnects since the last video frame or user retry.
         public var reconnectAttempts: Int
         /// Stable selection retained across temporary availability loss.
         public var selectedDeviceID: DeviceID?

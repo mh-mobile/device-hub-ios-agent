@@ -79,7 +79,12 @@ extension RemoteSessionFeature {
         session.evaluatedAt = now
         session.frame = frame
         session.remoteState = remoteState
-        state.reconnectAttempts = 0
+        // Only video proves the session works: every reconnect takes a
+        // screenshot before video starts, so a screenshot must not refill the
+        // budget while video keeps failing.
+        if frame.metadata.kind == .videoFrame {
+            state.reconnectAttempts = 0
+        }
         state.remediation = nil
         state.session = session
         if previousScreen?.kind != .videoFrame,
