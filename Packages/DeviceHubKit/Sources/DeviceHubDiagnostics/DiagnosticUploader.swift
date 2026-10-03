@@ -155,7 +155,10 @@ public extension DiagnosticUploadClient {
             context: configuration.context
         )
         @Sendable
-        func sendEnvelope(_ envelope: DiagnosticWireEnvelope) async throws(DiagnosticUploadFailure) {
+        func sendEnvelope(
+            _ envelope: DiagnosticWireEnvelope,
+            accepted: () -> Void
+        ) async throws(DiagnosticUploadFailure) {
             let body = try envelope.canonicalJSON()
             guard body.count <= configuration.maximumRequestBodyByteCount else {
                 throw .bodyTooLarge
@@ -178,7 +181,8 @@ public extension DiagnosticUploadClient {
             try await send(
                 request,
                 using: session,
-                maximumResponseBodyByteCount: configuration.maximumResponseBodyByteCount
+                maximumResponseBodyByteCount: configuration.maximumResponseBodyByteCount,
+                accepted: accepted
             )
         }
 
@@ -207,14 +211,17 @@ public extension DiagnosticUploadClient {
                     guard !Task.isCancelled else {
                         throw .cancelled
                     }
-                    try await sendEnvelope(envelope)
+                    // A batch counts once the server accepts it (2xx), even if
+                    // reading the response body fails afterwards.
+                    try await sendEnvelope(envelope) {
+                        deliveredThrough = envelope.events.last?.sequence ?? deliveredThrough
+                    }
                 } catch {
                     guard let deliveredThrough else {
                         throw error
                     }
                     throw .partiallyDelivered(throughSequence: deliveredThrough, failure: error)
                 }
-                deliveredThrough = envelope.events.last?.sequence ?? deliveredThrough
             }
         }
     }
@@ -222,7 +229,8 @@ public extension DiagnosticUploadClient {
     private static func send(
         _ request: URLRequest,
         using session: URLSession,
-        maximumResponseBodyByteCount: Int
+        maximumResponseBodyByteCount: Int,
+        accepted: () -> Void
     ) async throws(DiagnosticUploadFailure) {
         do {
             let (responseBytes, response) = try await session.bytes(
@@ -239,6 +247,7 @@ public extension DiagnosticUploadClient {
                     statusCode: httpResponse.statusCode
                 )
             }
+            accepted()
 
             var receivedByteCount = 0
             for try await _ in responseBytes {
