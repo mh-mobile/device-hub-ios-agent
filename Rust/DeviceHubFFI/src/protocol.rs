@@ -57,6 +57,9 @@ const PAIR_SETUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 // slower is dropped so it cannot hold the one pairing slot for
 // PAIR_SETUP_TIMEOUT.
 const PAIRING_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+// From accepting a connection to showing the pairing code (handshake and Pair
+// Setup M1 only); the user's part afterwards keeps PAIR_SETUP_TIMEOUT.
+const PAIRING_PRE_CODE_TIMEOUT: Duration = Duration::from_secs(15);
 const PAIR_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 const RSD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -185,64 +188,74 @@ async fn run_pairing(
         DhSessionState::Running,
     )?;
 
-    let stream = accept_pairing_peer(&listener, PAIRING_FIRST_FRAME_TIMEOUT).await?;
-    emitter.phase(DhConnectionPhase::Pairing, DhSessionState::Running)?;
+    pair_with_responsive_peer(
+        &listener,
+        PAIRING_FIRST_FRAME_TIMEOUT,
+        PAIRING_PRE_CODE_TIMEOUT,
+        async |stream, code_shown| {
+            emitter.phase(DhConnectionPhase::Pairing, DhSessionState::Running)?;
+            let mut pairing_file = operation.controller.pairing_file(None);
+            let host_info = PairableHostInfo {
+                name: operation.display_name.clone(),
+                model: operation.model.clone(),
+                udid: operation.controller.udid.clone(),
+                identifier: operation.controller.identifier.clone(),
+                wire_protocol_version: 26,
+                alt_irk: *operation.controller.alternate_irk,
+            };
+            let socket = RpPairingSocket::new_device(stream);
+            let mut host = PairableHost::new(socket, host_info);
+            let pin_emitter = emitter.clone();
+            let persist_gate = persistence.clone();
 
-    let mut pairing_file = operation.controller.pairing_file(None);
-    let host_info = PairableHostInfo {
-        name: operation.display_name,
-        model: operation.model,
-        udid: operation.controller.udid.clone(),
-        identifier: operation.controller.identifier.clone(),
-        wire_protocol_version: 26,
-        alt_irk: *operation.controller.alternate_irk,
-    };
-    let socket = RpPairingSocket::new_device(stream);
-    let mut host = PairableHost::new(socket, host_info);
-    let pin_emitter = emitter.clone();
-    let persist_gate = persistence.clone();
-
-    stage(
-        PAIR_SETUP_TIMEOUT,
-        PublicFailure::new(
-            "pair_setup_failed",
-            "pair_setup",
-            false,
-            "The authenticated Pair Setup exchange failed.",
-        ),
-        host.accept_fallible(
-            &mut pairing_file,
-            move |pin| {
-                let pin_emitter = pin_emitter.clone();
-                async move {
-                    pin_emitter
-                        .pairing_code(pin)
-                        .map_err(event_failure_as_idevice)
-                }
-            },
-            move |state, peer| {
-                let persist_gate = persist_gate.clone();
-                async move {
-                    let mut record =
-                        PeerRecord::from_verified(&peer).map_err(validation_as_idevice)?;
-                    let kind = match state {
-                        PairRecordState::Provisional => DhEventKind::PairRecordProvisional,
-                        PairRecordState::Committed => {
-                            record.completion = DhPairingCompletion::Committed;
-                            DhEventKind::PairRecordCommitted
+            stage(
+                PAIR_SETUP_TIMEOUT,
+                PublicFailure::new(
+                    "pair_setup_failed",
+                    "pair_setup",
+                    false,
+                    "The authenticated Pair Setup exchange failed.",
+                ),
+                host.accept_fallible(
+                    &mut pairing_file,
+                    move |pin| {
+                        let pin_emitter = pin_emitter.clone();
+                        code_shown.store(true, Ordering::Release);
+                        async move {
+                            pin_emitter
+                                .pairing_code(pin)
+                                .map_err(event_failure_as_idevice)
                         }
-                    };
-                    tokio::time::timeout(PERSISTENCE_TIMEOUT, persist_gate.persist(kind, record))
-                        .await
-                        .map_err(|_| {
-                            idevice::IdeviceError::RemotePairing(
-                            idevice::remote_pairing::errors::RemotePairingError::
-                                PairRecordPersistenceFailed,
-                        )
-                        })?
-                }
-            },
-        ),
+                    },
+                    move |state, peer| {
+                        let persist_gate = persist_gate.clone();
+                        async move {
+                            let mut record =
+                                PeerRecord::from_verified(&peer).map_err(validation_as_idevice)?;
+                            let kind = match state {
+                                PairRecordState::Provisional => DhEventKind::PairRecordProvisional,
+                                PairRecordState::Committed => {
+                                    record.completion = DhPairingCompletion::Committed;
+                                    DhEventKind::PairRecordCommitted
+                                }
+                            };
+                            tokio::time::timeout(
+                                PERSISTENCE_TIMEOUT,
+                                persist_gate.persist(kind, record),
+                            )
+                            .await
+                            .map_err(|_| {
+                                idevice::IdeviceError::RemotePairing(
+                                    idevice::remote_pairing::errors::RemotePairingError::
+                                        PairRecordPersistenceFailed,
+                                )
+                            })?
+                        }
+                    },
+                ),
+            )
+            .await
+        },
     )
     .await?;
 
@@ -2590,6 +2603,44 @@ fn pair_verify_failure(error: IdeviceError) -> PublicFailure {
     )
 }
 
+/// Runs `attempt` (Pair Setup) on accepted connections until one reaches the
+/// pairing code, which `attempt` reports by setting the flag it is given.
+///
+/// Before the code is shown the peer has only exchanged protocol messages, so
+/// a connection that does not get there within `pre_code_timeout`, or fails
+/// first, is dropped and the next one accepted: otherwise a client could send
+/// a valid handshake, stop before Pair Setup M1, and hold the only pairing
+/// slot for the whole Pair Setup timeout. Once the code is shown the attempt
+/// runs to its own end, since the user is now entering it.
+async fn pair_with_responsive_peer<T>(
+    listener: &TcpListener,
+    first_frame_timeout: Duration,
+    pre_code_timeout: Duration,
+    mut attempt: impl AsyncFnMut(tokio::net::TcpStream, Arc<AtomicBool>) -> Result<T, PublicFailure>,
+) -> Result<T, PublicFailure> {
+    loop {
+        let stream = accept_pairing_peer(listener, first_frame_timeout).await?;
+        let code_shown = Arc::new(AtomicBool::new(false));
+        let setup = attempt(stream, Arc::clone(&code_shown));
+        tokio::pin!(setup);
+        let pre_code_deadline = tokio::time::sleep(pre_code_timeout);
+        tokio::pin!(pre_code_deadline);
+        let result = tokio::select! {
+            result = &mut setup => result,
+            () = &mut pre_code_deadline => {
+                if !code_shown.load(Ordering::Acquire) {
+                    continue; // dropping `setup` closes the connection
+                }
+                setup.await
+            }
+        };
+        if result.is_err() && !code_shown.load(Ordering::Acquire) {
+            continue;
+        }
+        return result;
+    }
+}
+
 /// Accepts the first connection that delivers a whole RPPairing frame
 /// within `first_frame_timeout`. A connection that stays silent, trickles
 /// bytes, speaks another protocol, or closes is dropped and the next one is
@@ -3784,6 +3835,54 @@ mod tests {
             .expect("the accepted connection is the one that sent the frame")
             .unwrap();
         assert_eq!(first, frame);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stalls_before_the_pairing_code_does_not_hold_the_slot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // A well-formed first frame, then: silence before M1; a failure
+        // before the code; and finally a peer that gets the code shown.
+        let mut peers = Vec::new();
+        for body in [&b"stall"[..], b"fail", b"pair"] {
+            let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
+            peer.write_all(&rppairing_frame(body)).await.unwrap();
+            peers.push(peer);
+        }
+
+        let paired = tokio::time::timeout(
+            Duration::from_secs(5),
+            pair_with_responsive_peer(
+                &listener,
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+                async |mut stream, code_shown| {
+                    let mut frame = vec![0u8; 11];
+                    stream.read_exact(&mut frame).await.unwrap();
+                    let mut body =
+                        vec![0u8; usize::from(u16::from_be_bytes([frame[9], frame[10]]))];
+                    stream.read_exact(&mut body).await.unwrap();
+                    match body.as_slice() {
+                        b"stall" => std::future::pending().await,
+                        b"fail" => Err(PublicFailure::new(
+                            "pair_setup_failed",
+                            "pair_setup",
+                            false,
+                            "stray",
+                        )),
+                        _ => {
+                            code_shown.store(true, Ordering::Release);
+                            Ok(body)
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("stalled and failed peers are dropped before the code is shown");
+
+        assert_eq!(paired.ok(), Some(b"pair".to_vec()));
     }
 
     #[tokio::test]
