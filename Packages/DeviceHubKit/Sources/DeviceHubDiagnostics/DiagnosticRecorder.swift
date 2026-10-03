@@ -159,6 +159,9 @@ public actor DiagnosticRecorder {
             throw DiagnosticError.cancelled(.foregroundFlush)
         } catch {
             try await keepUndeliveredEvents(after: error)
+            if error.stoppingFailure == .cancelled {
+                throw DiagnosticError.cancelled(.foregroundFlush)
+            }
             throw DiagnosticError.upload(error.stoppingFailure)
         }
 

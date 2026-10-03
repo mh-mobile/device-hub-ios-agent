@@ -125,6 +125,29 @@ struct DiagnosticUploaderTests {
         }
     }
 
+    @Test func reportsDeliveredBatchesWhenCancelledPartWay() async throws {
+        let requests = LockedRequests()
+        DiagnosticURLProtocolStub.install { request in
+            requests.append(request)
+            guard requests.values.count == 1 else {
+                throw URLError(.cancelled)
+            }
+            return (.fixture(url: request.url, statusCode: 200), Data())
+        }
+        let client = try makeClient()
+        let payload = try snapshot(eventCount: 201).encoded()
+
+        do {
+            try await client.upload(payload)
+            Issue.record("The cancelled second batch unexpectedly succeeded.")
+        } catch {
+            expectNoDifference(
+                error,
+                DiagnosticUploadFailure.partiallyDelivered(throughSequence: 100, failure: .cancelled)
+            )
+        }
+    }
+
     @Test func mapsTransportTimeoutAndCancellationWithoutUnderlyingDetails() async throws {
         let payload = try snapshot(eventCount: 1).encoded()
         for (error, expectedFailure) in [

@@ -121,7 +121,8 @@ struct DiagnosticRecorderExpiryTests {
         (.rejected(statusCode: 503), [1, 2]),
         (.transportFailed, [1, 2]),
         (.partiallyDelivered(throughSequence: 1, failure: .transportFailed), [2]),
-        (.partiallyDelivered(throughSequence: 1, failure: .rejected(statusCode: 400)), [])
+        (.partiallyDelivered(throughSequence: 1, failure: .rejected(statusCode: 400)), []),
+        (.partiallyDelivered(throughSequence: 1, failure: .cancelled), [2])
     ])
     func failedFlushKeepsOnlyWhatCanStillBeDelivered(
         failure: DiagnosticUploadFailure,
@@ -155,8 +156,17 @@ struct DiagnosticRecorderExpiryTests {
         )
         try await recorder.restore()
 
-        await #expect(throws: DiagnosticError.self) {
-            try await recorder.flushOnForeground()
+        // A cancellation still reads as one to the caller, whatever was sent.
+        let expected: DiagnosticError? = failure.stoppingFailure == .cancelled
+            ? .cancelled(.foregroundFlush)
+            : nil
+        do {
+            _ = try await recorder.flushOnForeground()
+            Issue.record("The failed upload unexpectedly flushed.")
+        } catch let error as DiagnosticError {
+            if let expected {
+                #expect(error == expected)
+            }
         }
 
         // Delivered events are dropped so a later batch cannot resend them

@@ -198,17 +198,18 @@ public extension DiagnosticUploadClient {
                 from: snapshot,
                 now: now()
             )
-            // Reported on failure so the recorder drops what the server
-            // already has instead of sending it again under a new batch ID.
+            // Reported on any failure, cancellation included, so the recorder
+            // drops what the server already has instead of sending it again
+            // under a new batch ID.
             var deliveredThrough: UInt64?
             for envelope in envelopes {
-                guard !Task.isCancelled else {
-                    throw .cancelled
-                }
                 do throws(DiagnosticUploadFailure) {
+                    guard !Task.isCancelled else {
+                        throw .cancelled
+                    }
                     try await sendEnvelope(envelope)
                 } catch {
-                    guard let deliveredThrough, error != .cancelled else {
+                    guard let deliveredThrough else {
                         throw error
                     }
                     throw .partiallyDelivered(throughSequence: deliveredThrough, failure: error)
