@@ -708,7 +708,7 @@ async fn run_control_stream(
         update_geometry_orientation(&mut video.geometry, &initial_orientation)?;
         let mut audio_open = true;
         let mut last_audio_sequence: Option<u16> = None;
-        let mut audio_ssrc: Option<u32> = None;
+        let mut audio_stream: Option<AudioStreamIdentity> = None;
         let first_video_frame_deadline = tokio::time::sleep(FIRST_VIDEO_FRAME_TIMEOUT);
         tokio::pin!(first_video_frame_deadline);
         let mut has_emitted_video_access_unit = false;
@@ -802,11 +802,14 @@ async fn run_control_stream(
                 datagram = audio_udp.recv(), if audio_open => {
                     match datagram {
                         Ok(datagram) => {
-                            if let Some(packet) = audio_rtp_packet(&datagram.data, audio_ssrc) {
-                                // Learn the stream's SSRC only from packets that
-                                // cannot be RTCP (second byte outside 192..=223).
+                            if let Some(packet) = audio_rtp_packet(&datagram.data, audio_stream) {
+                                // Learn the stream only from packets that cannot
+                                // be RTCP (second byte outside 192..=223).
                                 if !(192..=223).contains(&datagram.data[1]) {
-                                    audio_ssrc = Some(packet.ssrc);
+                                    audio_stream = Some(AudioStreamIdentity {
+                                        payload_type: packet.payload_type,
+                                        ssrc: packet.ssrc,
+                                    });
                                 }
                                 if let Some(last) = last_audio_sequence
                                     && packet.sequence_number != last.wrapping_add(1)
@@ -2230,15 +2233,26 @@ const fn orientation_state_failed() -> PublicFailure {
 /// Media datagram events must carry at least one byte (the Swift decoder fails
 /// the whole session otherwise), so RTCP, malformed packets, and header-only or
 /// padding-only RTP are dropped here instead of reaching the controller.
-/// `stream_ssrc` is the audio stream's SSRC once a packet that cannot be
-/// RTCP has shown it.
-fn audio_rtp_packet(datagram: &[u8], stream_ssrc: Option<u32>) -> Option<RtpPacket<'_>> {
-    // A structural RTCP match that carries the stream's own SSRC where RTP
-    // does (bytes 8..12) is a marked RTP packet whose sequence number happened
-    // to read as a fitting length.
-    let carries_stream_ssrc =
-        stream_ssrc.is_some_and(|ssrc| datagram.get(8..12) == Some(&ssrc.to_be_bytes()[..]));
-    if is_audio_rtcp(datagram) && !carries_stream_ssrc {
+/// The audio stream's payload type and SSRC, learned from a packet that
+/// cannot be RTCP.
+#[derive(Clone, Copy)]
+struct AudioStreamIdentity {
+    payload_type: u8,
+    ssrc: u32,
+}
+
+/// `stream` is the audio stream's identity once a packet that cannot be RTCP
+/// has shown it.
+fn audio_rtp_packet(datagram: &[u8], stream: Option<AudioStreamIdentity>) -> Option<RtpPacket<'_>> {
+    // A structural RTCP match is kept as RTP only if it carries both the
+    // stream's marked payload type and its SSRC where RTP keeps them. The
+    // SSRC alone is not enough: RTPFB and PSFB name the media source SSRC at
+    // the same bytes.
+    let is_stream_packet = stream.is_some_and(|stream| {
+        datagram.get(1) == Some(&(0x80 | stream.payload_type))
+            && datagram.get(8..12) == Some(&stream.ssrc.to_be_bytes()[..])
+    });
+    if is_audio_rtcp(datagram) && !is_stream_packet {
         return None;
     }
     RtpPacket::parse_checked(datagram)
@@ -2889,22 +2903,51 @@ mod tests {
     }
 
     #[test]
-    fn marked_rtp_whose_sequence_fits_an_rtcp_length_keeps_the_stream_ssrc() {
+    fn marked_rtp_whose_sequence_fits_an_rtcp_length_matches_the_stream_identity() {
         // Valid marked RTP (PT 79, sequence 3, SSRC 2) whose sequence number
         // reads as an RTCP length of exactly 16 bytes.
         let packet = [
             0x80, 0xCF, 0x00, 0x03, 0, 0, 0, 1, 0, 0, 0, 2, 0xAA, 0xBB, 0xCC, 0xDD,
         ];
-        // Once the stream's SSRC is known, its packets are not mistaken for
-        // RTCP; before any unambiguous packet the structure alone decides.
+        // Once the stream's payload type and SSRC are known, its packets are
+        // not mistaken for RTCP; before that the structure alone decides.
+        let stream = Some(AudioStreamIdentity {
+            payload_type: 79,
+            ssrc: 2,
+        });
         assert_eq!(
-            audio_rtp_packet(&packet, Some(2)).map(|packet| packet.payload.to_vec()),
+            audio_rtp_packet(&packet, stream).map(|packet| packet.payload.to_vec()),
             Some(vec![0xAA, 0xBB, 0xCC, 0xDD])
         );
         assert!(audio_rtp_packet(&packet, None).is_none());
-        // A real report still goes, whatever SSRC the stream has.
-        let report = [0x81, 207, 0x00, 0x03, 0, 0, 0, 2, 0, 0, 0, 9, 0, 0, 0, 3];
-        assert!(audio_rtp_packet(&report, Some(2)).is_none());
+        // Feedback (RTPFB 205, PSFB 206) names the media source SSRC at the
+        // same bytes RTP keeps its SSRC: the SSRC alone must not make it RTP.
+        for packet_type in [205_u8, 206] {
+            // First byte 0x80 (FMT 0): read as RTP it has no CSRCs, so it
+            // parses with a 4-byte payload and only the classifier stops it.
+            let feedback = [
+                0x80,
+                packet_type,
+                0x00,
+                0x03,
+                0,
+                0,
+                0,
+                7,
+                0,
+                0,
+                0,
+                2,
+                0,
+                0,
+                0,
+                0,
+            ];
+            assert!(
+                audio_rtp_packet(&feedback, stream).is_none(),
+                "feedback {packet_type} naming the stream"
+            );
+        }
     }
 
     #[test]
