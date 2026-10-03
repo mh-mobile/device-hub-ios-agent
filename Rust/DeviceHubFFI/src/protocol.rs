@@ -85,6 +85,8 @@ const ORIENTATION_CONFIGURATION_LOCK_TIMEOUT: Duration = Duration::from_secs(4);
 const MEDIA_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_TIMEOUT: Duration = Duration::from_secs(12);
 const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+// Commands waiting behind the current one before a new peak is traced.
+const INPUT_QUEUE_TRACE_DEPTH: usize = 8;
 const MEDIA_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 // One control stream at a time. A previous session's `stopAll` can land late
 // (e.g. its teardown was suspended in the background) and would otherwise kill
@@ -1312,6 +1314,9 @@ async fn run_input_loop(
 ) -> Result<(), PublicFailure> {
     let mut cleanup = InputCleanupState::default();
     let mut stashed = None;
+    // The queue is unbounded; tracing each new peak (and the session's peak at
+    // the end) shows whether long agent runs ever let it grow.
+    let mut peak_depth = 0;
     let result = loop {
         let command = match stashed.take() {
             Some(command) => command,
@@ -1324,6 +1329,13 @@ async fn run_input_loop(
             break Ok(());
         }
         let command = collapse_moves(command, || commands.try_recv().ok(), &mut stashed);
+        let depth = commands.len();
+        if depth > peak_depth {
+            peak_depth = depth;
+            if depth >= INPUT_QUEUE_TRACE_DEPTH {
+                input_trace("queue", &format!("peak depth={depth}"));
+            }
+        }
         let trace_label = input_trace_label(&command);
         // A HID call that never answers fails the session instead of silently
         // swallowing every later input while video keeps playing.
@@ -1355,6 +1367,7 @@ async fn run_input_loop(
             input_trace("delivered", &trace_label);
         }
     };
+    input_trace("queue", &format!("session_peak depth={peak_depth}"));
     cleanup_inputs(
         &mut cleanup,
         &mut universal_hid,
