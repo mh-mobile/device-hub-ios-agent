@@ -57,8 +57,9 @@ const PAIR_SETUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 // slower is dropped so it cannot hold the one pairing slot for
 // PAIR_SETUP_TIMEOUT.
 const PAIRING_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
-// From accepting a connection to showing the pairing code (handshake and Pair
-// Setup M1 only); the user's part afterwards keeps PAIR_SETUP_TIMEOUT.
+// From the complete first frame to showing the pairing code (handshake and
+// Pair Setup M1), on top of PAIRING_FIRST_FRAME_TIMEOUT: about 25 s at most
+// from the TCP accept. The user's part afterwards keeps PAIR_SETUP_TIMEOUT.
 const PAIRING_PRE_CODE_TIMEOUT: Duration = Duration::from_secs(15);
 const PAIR_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -193,7 +194,9 @@ async fn run_pairing(
         PAIRING_FIRST_FRAME_TIMEOUT,
         PAIRING_PRE_CODE_TIMEOUT,
         async |stream, code_shown| {
-            emitter.phase(DhConnectionPhase::Pairing, DhSessionState::Running)?;
+            emitter
+                .phase(DhConnectionPhase::Pairing, DhSessionState::Running)
+                .map_err(PairingAttemptFailure::Local)?;
             let mut pairing_file = operation.controller.pairing_file(None);
             let host_info = PairableHostInfo {
                 name: operation.display_name.clone(),
@@ -255,6 +258,7 @@ async fn run_pairing(
                 ),
             )
             .await
+            .map_err(PairingAttemptFailure::Peer)
         },
     )
     .await?;
@@ -2603,12 +2607,20 @@ fn pair_verify_failure(error: IdeviceError) -> PublicFailure {
     )
 }
 
+/// Why a pairing attempt failed: the peer (try the next connection, if the
+/// code was not shown yet) or this side (end pairing).
+enum PairingAttemptFailure {
+    Peer(PublicFailure),
+    Local(PublicFailure),
+}
+
 /// Runs `attempt` (Pair Setup) on accepted connections until one reaches the
 /// pairing code, which `attempt` reports by setting the flag it is given.
 ///
 /// Before the code is shown the peer has only exchanged protocol messages, so
-/// a connection that does not get there within `pre_code_timeout`, or fails
-/// first, is dropped and the next one accepted: otherwise a client could send
+/// a connection that does not get there within `pre_code_timeout` of its
+/// first frame, or that the peer fails first, is dropped and the next one
+/// accepted; a local failure ends pairing. Otherwise a client could send
 /// a valid handshake, stop before Pair Setup M1, and hold the only pairing
 /// slot for the whole Pair Setup timeout. Once the code is shown the attempt
 /// runs to its own end, since the user is now entering it.
@@ -2616,7 +2628,10 @@ async fn pair_with_responsive_peer<T>(
     listener: &TcpListener,
     first_frame_timeout: Duration,
     pre_code_timeout: Duration,
-    mut attempt: impl AsyncFnMut(tokio::net::TcpStream, Arc<AtomicBool>) -> Result<T, PublicFailure>,
+    mut attempt: impl AsyncFnMut(
+        tokio::net::TcpStream,
+        Arc<AtomicBool>,
+    ) -> Result<T, PairingAttemptFailure>,
 ) -> Result<T, PublicFailure> {
     loop {
         let stream = accept_pairing_peer(listener, first_frame_timeout).await?;
@@ -2634,10 +2649,15 @@ async fn pair_with_responsive_peer<T>(
                 setup.await
             }
         };
-        if result.is_err() && !code_shown.load(Ordering::Acquire) {
-            continue;
+        match result {
+            // Only the peer's own failure before the code moves on; a local
+            // failure (this side cannot report progress) ends pairing.
+            Err(PairingAttemptFailure::Peer(_)) if !code_shown.load(Ordering::Acquire) => continue,
+            Err(PairingAttemptFailure::Peer(failure) | PairingAttemptFailure::Local(failure)) => {
+                return Err(failure);
+            }
+            Ok(value) => return Ok(value),
         }
-        return result;
     }
 }
 
@@ -3865,12 +3885,12 @@ mod tests {
                     stream.read_exact(&mut body).await.unwrap();
                     match body.as_slice() {
                         b"stall" => std::future::pending().await,
-                        b"fail" => Err(PublicFailure::new(
+                        b"fail" => Err(PairingAttemptFailure::Peer(PublicFailure::new(
                             "pair_setup_failed",
                             "pair_setup",
                             false,
                             "stray",
-                        )),
+                        ))),
                         _ => {
                             code_shown.store(true, Ordering::Release);
                             Ok(body)
@@ -3883,6 +3903,49 @@ mod tests {
         .expect("stalled and failed peers are dropped before the code is shown");
 
         assert_eq!(paired.ok(), Some(b"pair".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_local_failure_before_the_pairing_code_ends_pairing() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
+            peer.write_all(&rppairing_frame(b"{}")).await.unwrap();
+            peers.push(peer);
+        }
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+
+        // This side cannot report progress (its event dispatch is gone): that
+        // is not the peer's fault, so pairing ends instead of waiting for
+        // another connection.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            pair_with_responsive_peer(
+                &listener,
+                Duration::from_millis(100),
+                Duration::from_secs(5),
+                async |_stream, _code_shown| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(PairingAttemptFailure::Local(PublicFailure::new(
+                        "event_dispatch_unavailable",
+                        "session_dispatch",
+                        false,
+                        "gone",
+                    )))
+                },
+            ),
+        )
+        .await
+        .expect("a local failure ends pairing at once");
+
+        assert_eq!(
+            result.err().map(|failure| failure.code),
+            Some("event_dispatch_unavailable")
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
