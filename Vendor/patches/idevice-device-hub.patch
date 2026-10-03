@@ -2587,10 +2587,10 @@ index 473ce93d8fc223fd5fbb3281a1489855a19a94d9..3c5996727738f6f941e4c8370bcb319d
 +    }
 +}
 diff --git a/idevice/src/remote_pairing/tls_psk.rs b/idevice/src/remote_pairing/tls_psk.rs
-index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e8735990c08c 100644
+index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..84d260ece52d6ad8514eab5929b588e2422be419 100644
 --- a/idevice/src/remote_pairing/tls_psk.rs
 +++ b/idevice/src/remote_pairing/tls_psk.rs
-@@ -14,8 +14,9 @@ use std::pin::Pin;
+@@ -14,16 +14,21 @@ use std::pin::Pin;
  use std::task::{Context, Poll};
  use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
  use tracing::debug;
@@ -2601,8 +2601,10 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
  
  // TLS 1.2 constants
  const TLS_12: [u8; 2] = [0x03, 0x03];
-@@ -24,6 +25,9 @@ const CT_CHANGE_CIPHER_SPEC: u8 = 0x14;
+ const CT_HANDSHAKE: u8 = 0x16;
+ const CT_CHANGE_CIPHER_SPEC: u8 = 0x14;
  const CT_APPLICATION_DATA: u8 = 0x17;
++const CT_ALERT: u8 = 0x15;
  /// Maximum plaintext bytes per TLS record (RFC 5246 §6.2.1)
  const TLS_MAX_PLAINTEXT: usize = 16384;
 +/// RFC 5246 permits at most 2 KiB of record protection expansion.
@@ -2611,7 +2613,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
  const HS_CLIENT_HELLO: u8 = 0x01;
  const HS_SERVER_HELLO: u8 = 0x02;
  const HS_SERVER_HELLO_DONE: u8 = 0x0E;
-@@ -73,10 +77,10 @@ impl CipherSuite {
+@@ -73,10 +78,10 @@ impl CipherSuite {
  }
  
  struct KeyBlock {
@@ -2626,7 +2628,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      suite: CipherSuite,
  }
  
-@@ -131,7 +135,7 @@ fn derive_master_secret(
+@@ -131,7 +136,7 @@ fn derive_master_secret(
      server_random: &[u8; 32],
      suite: CipherSuite,
  ) -> Vec<u8> {
@@ -2635,7 +2637,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      let mut seed = client_random.to_vec();
      seed.extend_from_slice(server_random);
      prf(&premaster, b"master secret", &seed, 48, suite)
-@@ -148,15 +152,15 @@ fn derive_key_block(
+@@ -148,15 +153,15 @@ fn derive_key_block(
      let mac_len = suite.mac_key_len();
      let key_len = suite.enc_key_len();
      let total = mac_len * 2 + key_len * 2;
@@ -2656,7 +2658,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      KeyBlock {
          client_mac_key,
          server_mac_key,
-@@ -187,6 +191,40 @@ fn compute_mac(mac_key: &[u8], seq: u64, ct: u8, data: &[u8], suite: CipherSuite
+@@ -187,6 +192,40 @@ fn compute_mac(mac_key: &[u8], seq: u64, ct: u8, data: &[u8], suite: CipherSuite
      }
  }
  
@@ -2697,7 +2699,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
  fn encrypt_record(keys: &KeyBlock, seq: u64, ct: u8, plaintext: &[u8]) -> Vec<u8> {
      let mac = compute_mac(&keys.client_mac_key, seq, ct, plaintext, keys.suite);
  
-@@ -223,8 +261,8 @@ fn decrypt_record(
+@@ -223,8 +262,8 @@ fn decrypt_record(
      ct: u8,
      encrypted: &[u8],
  ) -> Result<Vec<u8>, IdeviceError> {
@@ -2708,7 +2710,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      }
  
      let iv = &encrypted[..16];
-@@ -244,42 +282,61 @@ fn decrypt_record(
+@@ -244,42 +283,61 @@ fn decrypt_record(
          CipherSuite::Aes128CbcSha => {
              let dec = Aes128CbcDec::new(read_key[..16].into(), iv.into());
              dec.decrypt_padded_vec_mut::<aes::cipher::block_padding::NoPadding>(ciphertext)
@@ -2791,7 +2793,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
  fn finished_verify_data(
      master: &[u8],
      label: &[u8],
-@@ -312,28 +369,136 @@ fn make_handshake(msg_type: u8, body: &[u8]) -> Vec<u8> {
+@@ -312,28 +370,136 @@ fn make_handshake(msg_type: u8, body: &[u8]) -> Vec<u8> {
  async fn read_record<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<u8>), IdeviceError> {
      let mut header = [0u8; 5];
      stream.read_exact(&mut header).await?;
@@ -2941,7 +2943,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
  }
  
  /// Perform TLS 1.2 PSK handshake and return an encrypted stream.
-@@ -343,8 +508,6 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+@@ -343,8 +509,6 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
  ) -> Result<TlsPskStream<S>, IdeviceError> {
      let mut client_random = [0u8; 32];
      rand::fill(&mut client_random);
@@ -2950,7 +2952,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      let mut transcript = Vec::new();
  
      // 1. ClientHello
-@@ -363,7 +526,12 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+@@ -363,7 +527,12 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
      stream.write_all(&make_record(CT_HANDSHAKE, &ch)).await?;
      debug!("Sent ClientHello");
  
@@ -2964,7 +2966,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      loop {
          let (ct, payload) = read_record(&mut stream).await?;
          if ct == 21 {
-@@ -392,53 +560,70 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+@@ -392,53 +561,70 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
          }
          transcript.extend_from_slice(&payload);
  
@@ -3064,7 +3066,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      let keys = derive_key_block(&master, &client_random, &server_random, suite);
  
      // 4. ClientKeyExchange (empty PSK identity)
-@@ -466,6 +651,7 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+@@ -466,6 +652,7 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
  
      // 7. Read server ChangeCipherSpec + Finished
      let mut server_seq: u64 = 0;
@@ -3072,7 +3074,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      loop {
          let (ct, payload) = read_record(&mut stream).await?;
          if ct == 21 {
-@@ -477,25 +663,29 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+@@ -477,25 +664,29 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
          }
          match ct {
              CT_CHANGE_CIPHER_SPEC => {
@@ -3116,7 +3118,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
              }
          }
      }
-@@ -510,10 +700,23 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+@@ -510,10 +701,23 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
          read_buf: Vec::new(),
          pending_record: Vec::new(),
          pending_record_total: 0,
@@ -3141,7 +3143,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
  /// An encrypted TLS-PSK stream implementing AsyncRead + AsyncWrite.
  pub struct TlsPskStream<S> {
      inner: S,
-@@ -526,8 +729,8 @@ pub struct TlsPskStream<S> {
+@@ -526,8 +730,8 @@ pub struct TlsPskStream<S> {
      pending_record: Vec<u8>,
      /// Expected total bytes for the current inbound record (5 + body_len), 0 if unknown
      pending_record_total: usize,
@@ -3152,7 +3154,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
  }
  
  impl<S> std::fmt::Debug for TlsPskStream<S> {
-@@ -542,14 +745,8 @@ impl<S> std::fmt::Debug for TlsPskStream<S> {
+@@ -542,14 +746,8 @@ impl<S> std::fmt::Debug for TlsPskStream<S> {
  impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsPskStream<S> {
      /// Encrypt and send application data, splitting into multiple TLS records if needed.
      pub async fn write_app_data(&mut self, data: &[u8]) -> Result<(), IdeviceError> {
@@ -3169,7 +3171,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
          Ok(())
      }
  
-@@ -574,7 +771,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsPskStream<S> {
+@@ -574,7 +772,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsPskStream<S> {
  }
  
  // AsyncRead: assemble complete TLS records across multiple poll_read calls
@@ -3178,7 +3180,29 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      fn poll_read(
          self: Pin<&mut Self>,
          cx: &mut Context<'_>,
-@@ -650,7 +847,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
+@@ -611,6 +809,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
+                 match decrypt_record(&this.keys, true, this.read_seq, ct, &body) {
+                     Ok(plaintext) => {
+                         this.read_seq += 1;
++                        match ct {
++                            CT_APPLICATION_DATA => {}
++                            // The peer is closing (or failing) the connection.
++                            CT_ALERT => return Poll::Ready(Ok(())),
++                            _ => {
++                                return Poll::Ready(Err(std::io::Error::other(format!(
++                                    "unexpected TLS record type {ct} after the handshake"
++                                ))));
++                            }
++                        }
++                        // An empty record is legal; returning nothing would
++                        // read as end of stream, so wait for the next one.
++                        if plaintext.is_empty() {
++                            continue;
++                        }
+                         let n = buf.remaining().min(plaintext.len());
+                         buf.put_slice(&plaintext[..n]);
+                         if n < plaintext.len() {
+@@ -650,7 +863,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
      }
  }
  
@@ -3229,7 +3253,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
      fn poll_write(
          self: Pin<&mut Self>,
          cx: &mut Context<'_>,
-@@ -658,63 +897,591 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncWrite for TlsPskStrea
+@@ -658,63 +913,647 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncWrite for TlsPskStrea
      ) -> Poll<std::io::Result<usize>> {
          let this = self.get_mut();
  
@@ -3593,6 +3617,62 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..1e72df768481cb73eaf1fa4ae1d4e873
 +            remaining = &remaining[record_length..];
 +        }
 +        records
++    }
++
++    /// A stream reading `records` sent by the server, each encrypted with
++    /// keys where the server's equal the client's so `encrypt_record` serves.
++    async fn read_stream(records: &[(u8, &[u8])]) -> TlsPskStream<tokio::io::DuplexStream> {
++        use tokio::io::AsyncWriteExt;
++        let mut keys = test_keys();
++        keys.server_mac_key = keys.client_mac_key.clone();
++        keys.server_write_key = keys.client_write_key.clone();
++        let mut wire = Vec::new();
++        for (seq, (ct, plaintext)) in records.iter().enumerate() {
++            wire.extend(make_record(
++                *ct,
++                &encrypt_record(&keys, seq as u64, *ct, plaintext),
++            ));
++        }
++        let (mut peer, inner) = tokio::io::duplex(64 * 1024);
++        peer.write_all(&wire).await.unwrap();
++        drop(peer);
++        TlsPskStream {
++            inner,
++            keys,
++            write_seq: 0,
++            read_seq: 0,
++            read_buf: Vec::new(),
++            pending_record: Vec::new(),
++            pending_record_total: 0,
++            pending_write: None,
++        }
++    }
++
++    #[tokio::test]
++    async fn an_empty_record_is_skipped_not_taken_as_end_of_stream() {
++        use tokio::io::AsyncReadExt;
++        let mut stream =
++            read_stream(&[(CT_APPLICATION_DATA, b""), (CT_APPLICATION_DATA, b"hi")]).await;
++        let mut buf = [0u8; 8];
++        let n = stream.read(&mut buf).await.unwrap();
++        assert_eq!(&buf[..n], b"hi");
++    }
++
++    #[tokio::test]
++    async fn an_alert_ends_the_stream_instead_of_reading_as_data() {
++        use tokio::io::AsyncReadExt;
++        // close_notify (warning, 0), then data that must not be delivered.
++        let mut stream = read_stream(&[(0x15, &[1, 0][..]), (CT_APPLICATION_DATA, b"late")]).await;
++        let mut buf = [0u8; 8];
++        assert_eq!(stream.read(&mut buf).await.unwrap(), 0);
++    }
++
++    #[tokio::test]
++    async fn an_unexpected_record_type_is_an_error() {
++        use tokio::io::AsyncReadExt;
++        let mut stream = read_stream(&[(CT_HANDSHAKE, b"hello")]).await;
++        let mut buf = [0u8; 8];
++        assert!(stream.read(&mut buf).await.is_err());
 +    }
 +
 +    #[tokio::test]
@@ -7806,7 +7886,7 @@ index 7de0f77d570cdb8015ba8fb27e56aa1af32eafc8..88c6b73602b2fa221ea02add9d24eb71
 +    }
  }
 diff --git a/idevice/src/services/core_device/hid.rs b/idevice/src/services/core_device/hid.rs
-index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e83a57109 100644
+index 59bf24437e8cff8909807ebb891fac0f3e170dba..5621e27c398bdb0f660f2a1dcd0cb0c0c04e8ba4 100644
 --- a/idevice/src/services/core_device/hid.rs
 +++ b/idevice/src/services/core_device/hid.rs
 @@ -11,8 +11,16 @@
@@ -7836,7 +7916,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
  }
  
  impl ButtonState {
-@@ -31,10 +40,67 @@ impl ButtonState {
+@@ -31,8 +40,65 @@ impl ButtonState {
          match self {
              ButtonState::Down => 1,
              ButtonState::Up => 2,
@@ -7868,10 +7948,10 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
 +            Self::VolumeDown => (0x0C, 0xEA),
 +            Self::Mute => (0x0C, 0xE2),
 +            Self::Siri => (0x0C, 0xCF),
-         }
-     }
- }
- 
++        }
++    }
++}
++
 +#[derive(Debug, Clone, Default, PartialEq, Eq)]
 +struct ButtonTracker {
 +    pressed: BTreeSet<HardwareButton>,
@@ -7892,19 +7972,17 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
 +            ButtonState::Up | ButtonState::Canceled => Err(HidInputError::InvalidStateTransition(
 +                "hardware button is not down",
 +            )),
-+        }
-+    }
+         }
+     }
 +
 +    #[cfg(test)]
 +    fn is_empty(&self) -> bool {
 +        self.pressed.is_empty()
 +    }
-+}
-+
+ }
+ 
  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
- pub enum DigitizerEventType {
-     Start,
-@@ -123,27 +189,303 @@ pub mod scroll_momentum {
+@@ -123,27 +189,313 @@ pub mod scroll_momentum {
  
  pub const DIGITIZER_REPORT_ID: u8 = 0x13;
  pub const TOUCHSCREEN_REPORT_ID: u8 = 0x09;
@@ -8194,17 +8272,27 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
 +    let candidate = u64::try_from(elapsed).unwrap_or(u64::MAX) & MASK;
 +    let mut previous = LAST.load(Ordering::Relaxed);
 +    loop {
-+        let next = if candidate > previous {
-+            candidate
-+        } else if previous < MASK {
-+            previous + 1
-+        } else {
-+            candidate
-+        };
++        let next = next_timestamp(previous, candidate);
 +        match LAST.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed) {
 +            Ok(_) => return next,
 +            Err(actual) => previous = actual,
 +        }
++    }
++}
++
++/// The timestamp to send after `previous`, given the masked clock reading.
++///
++/// A reading at or a little behind `previous` (coarse clock resolution) is
++/// nudged one past it. A reading far behind means the 48-bit clock wrapped,
++/// about 3.26 days into the process; the reading is taken as is, since
++/// nudging would advance every later report by only 1 ns.
++fn next_timestamp(previous: u64, candidate: u64) -> u64 {
++    const MASK: u64 = (1u64 << 48) - 1;
++    let wrapped = previous - candidate.min(previous) > MASK / 2;
++    if candidate > previous || wrapped || previous == MASK {
++        candidate
++    } else {
++        previous + 1
 +    }
  }
  
@@ -8216,7 +8304,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
  ///
  /// Layout: `[0x13][x:i32 LE][y:i32 LE][00 00][ts:6 LE][00 00]`.
  pub fn build_digitizer_report(x: i32, y: i32, timestamp: Option<u64>) -> Vec<u8> {
-@@ -158,19 +500,209 @@ pub fn build_digitizer_report(x: i32, y: i32, timestamp: Option<u64>) -> Vec<u8>
+@@ -158,19 +510,209 @@ pub fn build_digitizer_report(x: i32, y: i32, timestamp: Option<u64>) -> Vec<u8>
      r
  }
  
@@ -8433,7 +8521,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      r.extend_from_slice(&[0u8; 32]);
      r.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]);
      r.extend_from_slice(&ts.to_le_bytes()[..6]);
-@@ -178,12 +710,54 @@ pub fn build_touchscreen_report(state: u8, x: u16, y: u16, timestamp: Option<u64
+@@ -178,12 +720,54 @@ pub fn build_touchscreen_report(state: u8, x: u16, y: u16, timestamp: Option<u64
      r
  }
  
@@ -8488,7 +8576,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
  }
  
  #[cfg(feature = "rsd")]
-@@ -195,35 +769,19 @@ impl crate::RsdService for IndigoHidClient<Box<dyn ReadWrite>> {
+@@ -195,35 +779,19 @@ impl crate::RsdService for IndigoHidClient<Box<dyn ReadWrite>> {
      async fn from_stream(stream: Box<dyn ReadWrite>) -> Result<Self, IdeviceError> {
          let mut inner = RemoteXpcClient::new(stream).await?;
          inner.do_handshake().await?;
@@ -8532,7 +8620,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      }
  
      /// Send an `IndigoButtonEvent`: a single hardware-button state change.
-@@ -231,147 +789,92 @@ impl<R: ReadWrite> IndigoHidClient<R> {
+@@ -231,147 +799,92 @@ impl<R: ReadWrite> IndigoHidClient<R> {
      /// * `usage_page` - HID usage page (e.g. `0x0C` Consumer for media keys,
      ///   `0x01` Generic Desktop for power/sleep).
      /// * `usage_code` - HID usage within that page.
@@ -8568,15 +8656,15 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      }
  
 -    /// Send an `IndigoKeyboardButtonEvent`: a single keyboard key state change.
-+    /// Send a confirmed iOS hardware-button transition, rejecting duplicate
-+    /// downs and unmatched ups/cancellations before writing to the device.
-     ///
+-    ///
 -    /// * `usage_code` - HID Keyboard/Keypad page (`0x07`) usage, e.g. `0x04`=`a`,
 -    ///   `0x28`=Return, `0x2A`=Backspace, `0xE1`=Left Shift. The usage page is
 -    ///   implicit (keyboard); the device routes this to its `mainKeyboard`
 -    ///   surface.
 -    /// * `state` - [`ButtonState::Down`] or [`ButtonState::Up`].
--    ///
++    /// Send a confirmed iOS hardware-button transition, rejecting duplicate
++    /// downs and unmatched ups/cancellations before writing to the device.
+     ///
 -    /// To type a character that needs a modifier (uppercase, symbols), press the
 -    /// modifier key (e.g. `0xE1`) down, then the key down/up, then the modifier
 -    /// up.
@@ -8742,7 +8830,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      }
  }
  
-@@ -379,7 +882,7 @@ impl<R: ReadWrite> IndigoHidClient<R> {
+@@ -379,7 +892,7 @@ impl<R: ReadWrite> IndigoHidClient<R> {
  /// [`UniversalHidServiceClient::list_connected_services`]. The device also
  /// reports a verbose `_CoreDevice_codablePropertyStorage` mirror of these
  /// fields, which this skips.
@@ -8751,7 +8839,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
  pub struct HidSurface {
      /// The surface's identifier — the `service_id` to pass to
      /// [`UniversalHidServiceClient::send_report`].
-@@ -396,10 +899,52 @@ pub struct HidSurface {
+@@ -396,10 +909,52 @@ pub struct HidSurface {
      pub primary_usage_page: Option<u64>,
  }
  
@@ -8804,7 +8892,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
  }
  
  #[cfg(feature = "rsd")]
-@@ -411,28 +956,27 @@ impl crate::RsdService for UniversalHidServiceClient<Box<dyn ReadWrite>> {
+@@ -411,28 +966,27 @@ impl crate::RsdService for UniversalHidServiceClient<Box<dyn ReadWrite>> {
      async fn from_stream(stream: Box<dyn ReadWrite>) -> Result<Self, IdeviceError> {
          let mut inner = RemoteXpcClient::new(stream).await?;
          inner.do_handshake().await?;
@@ -8844,7 +8932,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      }
  
      /// Enumerate the device's currently-registered HID surfaces.
-@@ -446,81 +990,179 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
+@@ -446,81 +1000,179 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
          self.inner.send_object(msg, true).await?;
          let res = self.inner.recv().await?;
  
@@ -9066,7 +9154,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      pub async fn drag(
          &mut self,
          x1: u16,
-@@ -529,22 +1171,23 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
+@@ -529,29 +1181,79 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
          y2: u16,
          steps: u32,
          delay_ms: u64,
@@ -9099,8 +9187,21 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      }
  }
  
-@@ -552,6 +1195,42 @@ impl<R: ReadWrite> UniversalHidServiceClient<R> {
+ #[cfg(test)]
  mod tests {
++    #[test]
++    fn timestamp_keeps_advancing_after_the_48_bit_clock_wraps() {
++        const MASK: u64 = (1u64 << 48) - 1;
++        // Ordinary steps and ties at a coarse clock resolution.
++        assert_eq!(super::next_timestamp(100, 250), 250);
++        assert_eq!(super::next_timestamp(250, 250), 251);
++        // About 3.26 days in, the clock wraps from near MASK to near zero.
++        // Treating that as "behind" pinned every report at +1 ns, so taps and
++        // drags looked instantaneous; it must follow the clock instead.
++        assert_eq!(super::next_timestamp(MASK - 5, 40), 40);
++        assert_eq!(super::next_timestamp(40, 1_000_040), 1_000_040);
++    }
++
      use super::*;
  
 +    fn plist_dictionary(
@@ -9142,7 +9243,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
      #[test]
      fn digitizer_report_layout() {
          let r = build_digitizer_report(100, -50, Some(0x0102030405));
-@@ -566,7 +1245,11 @@ mod tests {
+@@ -566,7 +1268,11 @@ mod tests {
  
      #[test]
      fn touchscreen_report_layout() {
@@ -9155,7 +9256,7 @@ index 59bf24437e8cff8909807ebb891fac0f3e170dba..db5be60dbabda3919f0a058d3437c04e
          assert_eq!(r.len(), 58);
          assert_eq!(&r[0..4], &[0x09, 0x01, 0x05, 0xC2]);
          assert_eq!(&r[4..6], &375u16.to_le_bytes());
-@@ -583,4 +1266,455 @@ mod tests {
+@@ -583,4 +1289,455 @@ mod tests {
          let r = build_digitizer_report(0, 0, Some(u64::MAX));
          assert_eq!(&r[11..17], &[0xFF; 6]);
      }
