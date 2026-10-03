@@ -527,7 +527,7 @@ extension RemotePairingBonjourTransport {
         if state.servicesByName[serviceKey] == service {
             return
         }
-        // The cap bounds strangers only; a known (or ambiguous) device is let in.
+        // Known (or ambiguous) devices always get in; strangers only below 64 held.
         let isKnown = (try? KnownDeviceResolver.resolve(service, among: state.knownDevices) != nil) ?? true
         guard
             state.servicesByName[serviceKey] != nil
