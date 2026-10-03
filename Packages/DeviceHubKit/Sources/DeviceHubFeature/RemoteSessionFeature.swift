@@ -26,6 +26,7 @@ public struct RemoteSessionFeature {
     /// instead of reconnecting forever; a live frame starts the count over.
     public static let maximumReconnectAttempts = 5
 
+    @Dependency(\.agentBridge) var agentBridge
     @Dependency(\.backgroundExecution) var backgroundExecution
     @Dependency(\.continuousClock) var clock
     @Dependency(\.date) var date
@@ -46,6 +47,12 @@ public struct RemoteSessionFeature {
             Reduce(reduceConnection)
             Reduce(reduceMedia)
             Reduce(reduceInput)
+        }
+        // The agent may act only while the app itself accepts input.
+        .onChange(of: \.agentGrantKey) { _, _ in
+            Reduce { state, _ in
+                grantAgent(state: state)
+            }
         }
         .ifLet(\.$pairing, action: \.pairing) {
             PairingFeature()
