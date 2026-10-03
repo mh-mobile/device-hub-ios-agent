@@ -2714,7 +2714,7 @@ index 473ce93d8fc223fd5fbb3281a1489855a19a94d9..3c5996727738f6f941e4c8370bcb319d
 +    }
 +}
 diff --git a/idevice/src/remote_pairing/tls_psk.rs b/idevice/src/remote_pairing/tls_psk.rs
-index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520fb2b63a2a 100644
+index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..4c61dc8492de09d79e1ba36924c1354479cfcb1e 100644
 --- a/idevice/src/remote_pairing/tls_psk.rs
 +++ b/idevice/src/remote_pairing/tls_psk.rs
 @@ -14,16 +14,21 @@ use std::pin::Pin;
@@ -2999,13 +2999,16 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +
 +        if consumed != 0 {
 +            self.pending.drain(..consumed);
-+        }
+         }
+-        msgs.push((msg_type, data[pos..pos + 4 + msg_len].to_vec()));
+-        pos += 4 + msg_len;
 +        Ok(messages)
 +    }
 +
 +    fn is_empty(&self) -> bool {
 +        self.pending.is_empty()
-+    }
+     }
+-    msgs
 +}
 +
 +fn parse_server_hello(body: &[u8]) -> Result<([u8; 32], CipherSuite), IdeviceError> {
@@ -3040,9 +3043,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +            return Err(IdeviceError::UnexpectedResponse(
 +                "TLS-PSK ServerHello extensions are truncated".into(),
 +            ));
-         }
--        msgs.push((msg_type, data[pos..pos + 4 + msg_len].to_vec()));
--        pos += 4 + msg_len;
++        }
 +        let declared = usize::from(u16::from_be_bytes([extensions[0], extensions[1]]));
 +        if extensions.len() != declared + 2 {
 +            return Err(IdeviceError::UnexpectedResponse(
@@ -3064,8 +3065,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +        return Err(IdeviceError::UnexpectedResponse(
 +            "TLS-PSK ServerKeyExchange has an invalid identity hint".into(),
 +        ));
-     }
--    msgs
++    }
 +    Ok(())
  }
  
@@ -3245,12 +3245,13 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
              }
          }
      }
-@@ -510,10 +701,24 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
+@@ -510,10 +701,25 @@ pub async fn tls_psk_handshake<S: AsyncRead + AsyncWrite + Unpin + Send>(
          read_buf: Vec::new(),
          pending_record: Vec::new(),
          pending_record_total: 0,
 -        write_buf: Vec::new(),
 +        received_close_notify: false,
++        read_failed: false,
 +        pending_write: None,
      })
  }
@@ -3271,7 +3272,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
  /// An encrypted TLS-PSK stream implementing AsyncRead + AsyncWrite.
  pub struct TlsPskStream<S> {
      inner: S,
-@@ -526,8 +731,10 @@ pub struct TlsPskStream<S> {
+@@ -526,8 +732,14 @@ pub struct TlsPskStream<S> {
      pending_record: Vec<u8>,
      /// Expected total bytes for the current inbound record (5 + body_len), 0 if unknown
      pending_record_total: usize,
@@ -3279,12 +3280,16 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 -    write_buf: Vec<u8>,
 +    /// Set once close_notify arrives: every later read is end of stream.
 +    received_close_notify: bool,
++    /// Set once a read fails at the TLS level (a fatal alert, an unexpected
++    /// record type, a record that does not decrypt): the connection is over,
++    /// so every later read fails too.
++    read_failed: bool,
 +    /// Accepted outbound TLS record waiting to be flushed
 +    pending_write: Option<PendingWrite>,
  }
  
  impl<S> std::fmt::Debug for TlsPskStream<S> {
-@@ -542,14 +749,8 @@ impl<S> std::fmt::Debug for TlsPskStream<S> {
+@@ -542,14 +754,8 @@ impl<S> std::fmt::Debug for TlsPskStream<S> {
  impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsPskStream<S> {
      /// Encrypt and send application data, splitting into multiple TLS records if needed.
      pub async fn write_app_data(&mut self, data: &[u8]) -> Result<(), IdeviceError> {
@@ -3301,7 +3306,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
          Ok(())
      }
  
-@@ -574,13 +775,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsPskStream<S> {
+@@ -574,13 +780,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsPskStream<S> {
  }
  
  // AsyncRead: assemble complete TLS records across multiple poll_read calls
@@ -3316,10 +3321,13 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +        if this.received_close_notify {
 +            return Poll::Ready(Ok(()));
 +        }
++        if this.read_failed {
++            return Poll::Ready(Err(std::io::Error::other("TLS connection already failed")));
++        }
  
          // 1. Serve from decrypted buffer first
          if !this.read_buf.is_empty() {
-@@ -611,6 +815,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
+@@ -611,6 +823,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
                  match decrypt_record(&this.keys, true, this.read_seq, ct, &body) {
                      Ok(plaintext) => {
                          this.read_seq += 1;
@@ -3333,12 +3341,14 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +                                return Poll::Ready(Ok(()));
 +                            }
 +                            CT_ALERT => {
++                                this.read_failed = true;
 +                                return Poll::Ready(Err(std::io::Error::other(format!(
 +                                    "TLS alert {:?} from the peer",
 +                                    plaintext.get(1)
 +                                ))));
 +                            }
 +                            _ => {
++                                this.read_failed = true;
 +                                return Poll::Ready(Err(std::io::Error::other(format!(
 +                                    "unexpected TLS record type {ct} after the handshake"
 +                                ))));
@@ -3352,7 +3362,15 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
                          let n = buf.remaining().min(plaintext.len());
                          buf.put_slice(&plaintext[..n]);
                          if n < plaintext.len() {
-@@ -650,7 +880,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
+@@ -619,6 +859,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
+                         return Poll::Ready(Ok(()));
+                     }
+                     Err(e) => {
++                        this.read_failed = true;
+                         tracing::warn!(
+                             "TLS decrypt failed (ct={ct}, seq={}, body_len={}): {e}",
+                             this.read_seq,
+@@ -650,7 +891,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncRead for TlsPskStream
      }
  }
  
@@ -3403,7 +3421,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
      fn poll_write(
          self: Pin<&mut Self>,
          cx: &mut Context<'_>,
-@@ -658,63 +930,660 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncWrite for TlsPskStrea
+@@ -658,63 +941,666 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> AsyncWrite for TlsPskStrea
      ) -> Poll<std::io::Result<usize>> {
          let this = self.get_mut();
  
@@ -3749,6 +3767,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +            pending_record: Vec::new(),
 +            pending_record_total: 0,
 +            received_close_notify: false,
++            read_failed: false,
 +            pending_write: None,
 +        }
 +    }
@@ -3796,6 +3815,7 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +            pending_record: Vec::new(),
 +            pending_record_total: 0,
 +            received_close_notify: false,
++            read_failed: false,
 +            pending_write: None,
 +        }
 +    }
@@ -3824,17 +3844,21 @@ index 9b7360ce7f6f0138e90fdb4ce8c5e1fc68f12730..9b29d13ba4d99895994f9620d011520f
 +    #[tokio::test]
 +    async fn a_fatal_alert_is_an_error_not_a_clean_close() {
 +        use tokio::io::AsyncReadExt;
-+        // fatal (2), bad_record_mac (20).
-+        let mut stream = read_stream(&[(0x15, &[2, 20][..])]).await;
++        // fatal (2), bad_record_mac (20), then data that must not be read.
++        let mut stream = read_stream(&[(0x15, &[2, 20][..]), (CT_APPLICATION_DATA, b"late")]).await;
 +        let mut buf = [0u8; 8];
++        assert!(stream.read(&mut buf).await.is_err());
++        // The failure sticks: the connection is over.
 +        assert!(stream.read(&mut buf).await.is_err());
 +    }
 +
 +    #[tokio::test]
 +    async fn an_unexpected_record_type_is_an_error() {
 +        use tokio::io::AsyncReadExt;
-+        let mut stream = read_stream(&[(CT_HANDSHAKE, b"hello")]).await;
++        let mut stream =
++            read_stream(&[(CT_HANDSHAKE, b"hello"), (CT_APPLICATION_DATA, b"late")]).await;
 +        let mut buf = [0u8; 8];
++        assert!(stream.read(&mut buf).await.is_err());
 +        assert!(stream.read(&mut buf).await.is_err());
 +    }
 +
