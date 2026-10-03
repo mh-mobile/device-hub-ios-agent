@@ -96,15 +96,19 @@ struct RemoteStatusContent: Equatable {
     let label: String
     let symbolName: String
     let tone: RemoteStatusTone
+    /// Work is under way: the symbol spins instead of standing still.
+    let isInProgress: Bool
 
     init(
         label: String,
         symbolName: String,
-        tone: RemoteStatusTone
+        tone: RemoteStatusTone,
+        isInProgress: Bool = false
     ) {
         self.label = label
         self.symbolName = symbolName
         self.tone = tone
+        self.isInProgress = isInProgress
     }
 
     init(presentation: RemoteSessionPresentation?) {
@@ -113,7 +117,8 @@ struct RemoteStatusContent: Equatable {
             self.init(
                 label: phase.title,
                 symbolName: "progress.indicator",
-                tone: .neutral
+                tone: .neutral,
+                isInProgress: true
             )
         case .live:
             self.init(
@@ -180,5 +185,12 @@ extension View {
         #else
             self
         #endif
+    }
+}
+
+extension View {
+    /// Spins a status symbol while its work is under way.
+    func statusSymbolEffect(_ status: RemoteStatusContent) -> some View {
+        symbolEffect(.rotate, options: .repeat(.continuous), isActive: status.isInProgress)
     }
 }

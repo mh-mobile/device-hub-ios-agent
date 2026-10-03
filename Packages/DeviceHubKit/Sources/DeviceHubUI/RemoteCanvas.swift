@@ -442,6 +442,7 @@ private struct RemoteStatusBadge: View {
 
     var body: some View {
         Label(status.label, systemImage: status.symbolName)
+            .statusSymbolEffect(status)
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(.white)
             .padding(.horizontal, 12)

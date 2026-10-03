@@ -237,6 +237,15 @@ struct DeviceHubUIPresentationTests {
                     tone: .neutral
                 )
             ),
+            (
+                RemoteSessionPresentation.connecting(.locating),
+                RemoteStatusContent(
+                    label: "Locating device…",
+                    symbolName: "progress.indicator",
+                    tone: .neutral,
+                    isInProgress: true
+                )
+            ),
         ]
     )
     func freshnessCopy(
