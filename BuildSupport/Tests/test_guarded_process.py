@@ -45,6 +45,51 @@ def different_group_descendant_program(identity_path: Path) -> str:
 
 
 class GuardedProcessTests(unittest.TestCase):
+    def test_a_transient_process_inspection_failure_is_retried(self) -> None:
+        # Under heavy load (load average above 500) one ps run can time out;
+        # that alone must not fail a guarded operation that succeeded.
+        real_run = subprocess.run
+        calls = []
+
+        def flaky_run(arguments, *positional, **keywords):
+            calls.append(arguments)
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(arguments, keywords.get("timeout"))
+            return real_run(arguments, *positional, **keywords)
+
+        with mock.patch.object(guarded_process.subprocess, "run", flaky_run):
+            members = guarded_process.process_session_members(os.getsid(0))
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn(os.getpid(), [member.process_id for member in members])
+
+    def test_parent_waits_long_enough_for_the_watchdog_to_inspect_twice(self) -> None:
+        # The watchdog's cleanup inspects the session at least twice; killing
+        # it sooner would abandon the cleanup half way.
+        one_inspection = (
+            guarded_process.PROCESS_INSPECTION_ATTEMPTS
+            * guarded_process.PROCESS_INSPECTION_TIMEOUT_SECONDS
+        )
+        for grace_seconds in (0.1, 5.0, 30.0):
+            with self.subTest(grace_seconds=grace_seconds):
+                self.assertGreaterEqual(
+                    guarded_process.watchdog_supervision_timeout(grace_seconds),
+                    2 * one_inspection + grace_seconds,
+                )
+
+    def test_process_inspection_gives_up_after_its_attempts(self) -> None:
+        calls = []
+
+        def failing_run(arguments, *positional, **keywords):
+            calls.append(arguments)
+            raise subprocess.TimeoutExpired(arguments, keywords.get("timeout"))
+
+        with mock.patch.object(guarded_process.subprocess, "run", failing_run):
+            with self.assertRaisesRegex(OSError, "could not inspect"):
+                guarded_process.process_session_members(os.getsid(0))
+
+        self.assertEqual(len(calls), guarded_process.PROCESS_INSPECTION_ATTEMPTS)
+
     def test_session_inspection_tolerates_a_heavily_loaded_host(self) -> None:
         # Booting a simulator can push the load average past 200, where ps
         # takes seconds; a short limit failed the guard itself (status 126).
@@ -473,7 +518,10 @@ class GuardedProcessTests(unittest.TestCase):
 
             watchdog.kill.assert_called_once_with()
             self.assertEqual(watchdog.wait.call_count, 2)
-            self.assertEqual(watchdog.wait.call_args_list[0].kwargs["timeout"], 5.0)
+            self.assertEqual(
+                watchdog.wait.call_args_list[0].kwargs["timeout"],
+                guarded_process.watchdog_supervision_timeout(0.1),
+            )
         finally:
             for descriptor in (read_descriptor, write_descriptor):
                 try:

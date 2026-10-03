@@ -32,6 +32,9 @@ NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # ps normally answers in milliseconds, but booting a simulator can push the
 # load average past 200; a failed inspection fails the guarded command.
 PROCESS_INSPECTION_TIMEOUT_SECONDS = 15.0
+# A single ps run can time out on a host with a load average in the hundreds;
+# a guarded operation that succeeded must not fail for that alone.
+PROCESS_INSPECTION_ATTEMPTS = 3
 MAXIMUM_KILL_SWEEPS = 3
 WATCHDOG_NORMAL_COMPLETION_MESSAGE = b"device-hub-guard-complete-v1"
 PROCESS_STATUS_EXECUTABLES = (Path("/bin/ps"), Path("/usr/bin/ps"))
@@ -347,23 +350,26 @@ def process_session_members(
     environments are intentionally never read.
     """
 
-    try:
-        inspection = subprocess.run(
-            [
-                str(process_status_executable()),
-                "-axo",
-                "pid=,ppid=,comm=",
-            ],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=PROCESS_INSPECTION_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise OSError("could not inspect the guarded process session") from error
-    if inspection.returncode != 0:
-        raise OSError("could not inspect the guarded process session")
+    executable = str(process_status_executable())
+    failure: BaseException | None = None
+    for _ in range(PROCESS_INSPECTION_ATTEMPTS):
+        try:
+            inspection = subprocess.run(
+                [executable, "-axo", "pid=,ppid=,comm="],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=PROCESS_INSPECTION_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failure = error
+            continue
+        if inspection.returncode == 0:
+            break
+        failure = None
+    else:
+        raise OSError("could not inspect the guarded process session") from failure
 
     members: list[ProcessSessionMember] = []
     for process_line in inspection.stdout.splitlines():
@@ -681,6 +687,17 @@ def terminate_external_process_session(
         )
 
 
+def watchdog_supervision_timeout(grace_seconds: float) -> float:
+    """How long the parent waits for its watchdog before killing it.
+
+    The watchdog's cleanup inspects the session at least twice, and each
+    inspection may take every attempt on a heavily loaded host.
+    """
+
+    one_inspection = PROCESS_INSPECTION_ATTEMPTS * PROCESS_INSPECTION_TIMEOUT_SECONDS
+    return max(grace_seconds * 3, 5.0) + 2 * one_inspection
+
+
 def watchdog_main(arguments: Sequence[str]) -> int:
     """Kill an operation session unless its live guard completed normally."""
 
@@ -784,7 +801,7 @@ def parent_death_watchdog(
         if watchdog is not None:
             try:
                 watchdog_status = watchdog.wait(
-                    timeout=max(grace_seconds * 3, 5.0)
+                    timeout=watchdog_supervision_timeout(grace_seconds)
                 )
                 if watchdog_status != 0:
                     supervision_error = supervision_error or OSError(
