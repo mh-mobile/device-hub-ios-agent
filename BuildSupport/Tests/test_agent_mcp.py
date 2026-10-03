@@ -74,6 +74,7 @@ class AgentMCPTests(unittest.TestCase):
         newest = mcp.SUPPORTED_PROTOCOL_VERSIONS[0]
         for requested, expected in (
             ("2025-06-18", "2025-06-18"),
+            ("2025-03-26", "2025-03-26"),
             ("2024-11-05", "2024-11-05"),
             ("1999-01-01", newest),
             (None, newest),

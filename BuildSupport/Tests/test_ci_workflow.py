@@ -51,6 +51,13 @@ class CILocalGateContractTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0)
 
+        sample = subprocess.run(
+            ("git", "check-ignore", "-q", "--no-index", ".env.example"),
+            cwd=ROOT,
+            check=False,
+        )
+        self.assertEqual(sample.returncode, 1, ".env.example stays committable")
+
     def test_ci_keeps_the_outer_guard_while_nested_mise_tasks_reacquire_their_lock(self) -> None:
         source = CI_PATH.read_text()
 
