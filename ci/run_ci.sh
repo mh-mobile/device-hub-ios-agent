@@ -60,6 +60,9 @@ checkout_state() {
   {
     git status --porcelain=v1 --untracked-files=all
     git diff HEAD
+    # Status lists untracked files by path only; hash their contents too so a
+    # gate rewriting one (an uncommitted snapshot, say) is noticed.
+    git ls-files -z --others --exclude-standard | xargs -0 shasum -a 256
   } | shasum -a 256
 }
 CHECKOUT_BEFORE="$(checkout_state)"

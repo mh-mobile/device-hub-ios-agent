@@ -113,7 +113,7 @@ def bootstrap(
     lock_path = vendor_directory / ".idevice-bootstrap.lock"
 
     with _exclusive_lock(lock_path):
-        _remove_stale_staging(vendor_directory)
+        _remove_stale_staging(vendor_directory, destination)
         _verify_patch(specification)
 
         if destination.exists():
@@ -291,10 +291,22 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def _remove_stale_staging(vendor_directory: Path) -> None:
-    """Remove staging trees left by a bootstrap that died holding the lock."""
+def _remove_stale_staging(vendor_directory: Path, destination: Path) -> None:
+    """Clean up after a bootstrap that died holding the lock.
+
+    Staging trees are removed. A replacement killed between moving the old
+    tree aside and installing the new one leaves the backup as the only copy,
+    so it is restored when the destination is missing and removed otherwise.
+    """
     for path in vendor_directory.glob(".idevice-bootstrap-*"):
         if path.is_dir():
+            _remove_generated_tree(path, vendor_directory)
+    for path in sorted(vendor_directory.glob(".idevice-previous-*")):
+        if not path.is_dir():
+            continue
+        if not destination.exists():
+            os.replace(path, destination)
+        else:
             _remove_generated_tree(path, vendor_directory)
 
 
