@@ -155,9 +155,25 @@ visible, typed failure rather than an implicit mounting flow.
   cancellation clears the complete bitmap before teardown.
 - A successful write is not treated as proof that an input landed; real-device
   validation must observe the target.
-- Media teardown always names this app's session UUID. The upstream
-  `stopAll=true` convenience call is prohibited. If another host owns an unknown
-  media session, the app reports Device Busy rather than stopping that session.
+- **Intended, not yet met:** media teardown should name this app's session
+  UUID, and the upstream `stopAll=true` convenience call should not be used.
+  Today teardown still sends `stopAll=true`, because the pinned idevice exposes
+  only that, and the payload a session-scoped stop needs is not yet known (the
+  screen-sharing session is keyed by the `clientSessionID` sent at start, but
+  the stop request's schema is unverified). Within this app, sessions take turns
+  (`MEDIA_SESSION_TURN`), so a late teardown cannot stop this app's next
+  session; a session another host starts in that window can still be stopped.
+  Explicit stops stay: without one the target keeps its audio routed away.
+  Closing this needs, on a real device: keeping the start's `clientSessionID`
+  for the session's lifetime; capturing `getmediastreamserverstatus` before and
+  after start to see how sessions are named; ideally observing the
+  `stopmediastream` request Apple's Device Hub sends; then a vendor patch for a
+  session-scoped stop, verified by ending an old session while another host's
+  session runs and seeing that one survive. Start-time key names are not to be
+  guessed into the stop request.
+- If another host owns an unknown media session, the app should report Device
+  Busy rather than stopping that session; this depends on the same
+  session-scoped stop.
 
 ## Diagnostics boundary
 
