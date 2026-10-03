@@ -14,6 +14,14 @@ if [[ ! -d "$DEVELOPER_DIR" ]]; then
 fi
 INDEXSTORE_LIBRARY_DIR="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/lib"
 export DEVELOPER_DIR
+# Resolve periphery before PATH is rewritten below: /opt/homebrew/bin would
+# otherwise shadow the version mise pins, and its findings differ.
+PERIPHERY="$(command -v periphery || true)"
+PINNED_PERIPHERY="$(sed -n 's/^periphery = "\(.*\)"$/\1/p' "$ROOT/mise.toml")"
+if [[ -z "$PERIPHERY" || "$("$PERIPHERY" version)" != "$PINNED_PERIPHERY" ]]; then
+  echo "periphery $PINNED_PERIPHERY (pinned in mise.toml) is required; run it through mise." >&2
+  exit 1
+fi
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
 if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
   export DYLD_LIBRARY_PATH="$INDEXSTORE_LIBRARY_DIR:$DYLD_LIBRARY_PATH"
@@ -27,7 +35,7 @@ if [[ ! -d DeviceHub.xcodeproj ]]; then
   exit 1
 fi
 
-periphery scan \
+"$PERIPHERY" scan \
   --project "$ROOT/DeviceHub.xcodeproj" \
   --schemes DeviceHub \
   --report-include "Sources/DeviceHubApp/**/*.swift" \
@@ -60,7 +68,7 @@ trap 'rm -rf "$PACKAGE_DERIVED_DATA"' EXIT
     CODE_SIGNING_ALLOWED=NO
 )
 PACKAGE_INDEX_STORE="$PACKAGE_DERIVED_DATA/Index.noindex/DataStore"
-periphery scan \
+"$PERIPHERY" scan \
   --project-root "$PACKAGE_ROOT" \
   --index-store-path "$PACKAGE_INDEX_STORE" \
   --index-exclude "$PACKAGE_DERIVED_DATA/SourcePackages/checkouts/**" \

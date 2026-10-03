@@ -67,7 +67,7 @@ run_ui_snapshot_tests() {
     set -e
     if ! python3 "$ROOT/BuildSupport/guarded_process.py" \
       --cleanup-selected-xcode-test-service-hub \
-      --developer-dir "$(xcode-select -p)"; then
+      --developer-dir "${DEVELOPER_DIR:-$(xcode-select -p)}"; then
       printf 'Could not clean up Xcode test services.\n' >&2
       return 126
     fi
