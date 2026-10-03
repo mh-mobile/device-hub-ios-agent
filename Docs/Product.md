@@ -33,9 +33,15 @@ There is no dashboard and no Devices, Control, Logs, or Settings tab bar.
 ## Remote-session invariants
 
 - Switching devices clears the old frame before changing the selected name.
-- A frame older than one second is `Delayed`, never `Live`.
-- A frame older than three seconds is dimmed and labeled `Last frame`; input is
-  paused while the session reconnects.
+- Freshness is judged by the media transport, not by the age of the last
+  decoded frame. The device sends no new video while its screen is static, only
+  RTCP sender reports, so an old frame on a live stream is the current screen,
+  and input stays enabled. `Live` ends when the stream does: no video datagram
+  (RTP or RTCP) for ten seconds ends the session as stalled, and the app
+  reconnects.
+- Known limit: if the device stopped sending video RTP but kept sending RTCP,
+  that would look the same as a static screen. No other signal tells them
+  apart, so this is accepted rather than guessed at from frame age.
 - Touch input is enabled only after a fresh decoded frame and the matching HID
   channel are both ready for the same session generation.
 - The screen is aspect-fit without a decorative device bezel. Letterboxed
@@ -73,7 +79,7 @@ inside menus.
 
 The following block release even when the underlying protocol works:
 
-- stale pixels labeled live;
+- pixels labeled live after the media stream has ended or stalled;
 - fake devices or fixture fallback in the shipping app;
 - controls without a working effect;
 - protocol identifiers, addresses, or raw error codes in ordinary UI;
