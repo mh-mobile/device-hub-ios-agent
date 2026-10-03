@@ -189,8 +189,7 @@ struct AgentDragCleanupTests {
             },
             disconnect: {}
         )
-        let bridge = AgentBridge()
-        try bridge.update(
+        let bridge = try await grantedBridge(
             session: session,
             frame: remoteFrame(
                 generation: SessionGeneration(rawValue: fixtureUUID(96)),
@@ -219,7 +218,7 @@ struct AgentCoordinateTests {
     @Test("a point in a landscape screenshot is sent in native portrait pixels")
     func landscapePointsAreRotated() async throws {
         let recorded = LockIsolated<[DeviceCommand]>([])
-        let bridge = try agentBridge(
+        let bridge = try await agentBridge(
             nativePixels: PixelSize(width: 100, height: 200),
             orientation: .landscapeLeft,
             imageWidth: 200,
@@ -235,7 +234,7 @@ struct AgentCoordinateTests {
     @Test("a point outside the screenshot is rejected, not clamped")
     func outsidePointsAreRejected() async throws {
         let recorded = LockIsolated<[DeviceCommand]>([])
-        let bridge = try agentBridge(
+        let bridge = try await agentBridge(
             nativePixels: PixelSize(width: 100, height: 200),
             orientation: .portrait,
             imageWidth: 100,
@@ -255,7 +254,7 @@ struct AgentCoordinateTests {
         imageWidth: Int,
         imageHeight: Int,
         recorded: LockIsolated<[DeviceCommand]>
-    ) throws -> AgentBridge {
+    ) async throws -> AgentBridge {
         let context = try #require(CGContext(
             data: nil,
             width: imageWidth,
@@ -283,8 +282,24 @@ struct AgentCoordinateTests {
             command: { command in recorded.withValue { $0.append(command) } },
             disconnect: {}
         )
-        let bridge = AgentBridge()
-        bridge.update(session: session, frame: frame)
-        return bridge
+        return try await grantedBridge(session: session, frame: frame)
     }
+}
+
+/// A bridge granted `frame` of `session`, which a coordinator owns, as the
+/// session feature grants it while the app accepts input.
+func grantedBridge(session: DeviceSession, frame: RemoteDisplayFrame) async throws -> AgentBridge {
+    let coordinator = DeviceSessionCoordinator()
+    var client = DeviceHubClient.testValue
+    client.connect = { _ in session }
+    let attemptID = fixtureUUID(97)
+    _ = try await coordinator.replace(attemptID: attemptID, deviceID: session.device.id, using: client)
+    let bridge = AgentBridge()
+    bridge.set(AgentBridge.Grant(
+        attemptID: attemptID,
+        sessionID: session.id,
+        frame: frame,
+        coordinator: coordinator
+    ))
+    return bridge
 }

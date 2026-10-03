@@ -141,6 +141,20 @@ public extension RemoteSessionFeature {
         public var acceptsInput: Bool {
             lifecycle == .active && session?.acceptsInput == true
         }
+
+        /// What the agent API is granted: the shown video frame of an owned
+        /// session, only while the app accepts input. Nil revokes it.
+        var agentGrantKey: AgentGrantKey? {
+            guard acceptsInput,
+                  let session,
+                  let sessionID = session.sessionID,
+                  let metadata = session.frame?.metadata,
+                  metadata.kind == .videoFrame
+            else {
+                return nil
+            }
+            return AgentGrantKey(attemptID: session.attemptID, sessionID: sessionID, metadata: metadata)
+        }
     }
 
     /// User intents and dependency responses understood by the root feature.

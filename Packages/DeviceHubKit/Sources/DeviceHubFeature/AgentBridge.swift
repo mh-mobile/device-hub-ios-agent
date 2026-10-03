@@ -1,26 +1,41 @@
 import CoreGraphics
+import Dependencies
 import DeviceHubClient
 import DeviceHubCore
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
-/// The live session and its latest frame, for an agent driving the device over HTTP.
+/// What an agent driving the device over HTTP may use: the frame the app
+/// shows and accepts input for, and the session that owns it.
 ///
-/// Commands go straight to the session, beside the canvas's own input path: this is
-/// a prototype for agents, not part of the app's authorization model.
+/// The session feature grants this only while the app itself accepts input
+/// (an accepted video frame, the app active, the session ready) and revokes
+/// it as soon as that stops: stop, switch, background, inactive, or a session
+/// that ends. Commands go through the same `DeviceSessionCoordinator` checks
+/// as the canvas (owning attempt and session, unrevoked frame authorization),
+/// never straight to a `DeviceSession`.
 public final class AgentBridge: @unchecked Sendable {
     public static let shared = AgentBridge()
 
-    private let lock = NSLock()
-    private var session: DeviceSession?
-    private var frame: RemoteDisplayFrame?
+    struct Grant {
+        let attemptID: UUID
+        let sessionID: DeviceSessionID
+        let frame: RemoteDisplayFrame
+        let coordinator: DeviceSessionCoordinator
+    }
 
-    func update(session: DeviceSession, frame: RemoteDisplayFrame) {
-        lock.withLock {
-            self.session = session
-            self.frame = frame
-        }
+    private let lock = NSLock()
+    private var grant: Grant?
+
+    init() {}
+
+    func set(_ grant: Grant?) {
+        lock.withLock { self.grant = grant }
+    }
+
+    private var frame: RemoteDisplayFrame? {
+        lock.withLock { grant?.frame }
     }
 
     public enum Failure: Error, CustomStringConvertible {
@@ -32,12 +47,12 @@ public final class AgentBridge: @unchecked Sendable {
 
     /// Target pixel size of the latest frame: the coordinate space for every command.
     public func screenSize() throws -> (width: Int, height: Int) {
-        guard let frame = lock.withLock({ frame }) else { throw Failure.noSession }
+        guard let frame else { throw Failure.noSession }
         return (frame.image.width, frame.image.height)
     }
 
     public func screenshotPNG() throws -> Data {
-        guard let frame = lock.withLock({ frame }) else { throw Failure.noSession }
+        guard let frame else { throw Failure.noSession }
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)
         else { return Data() }
@@ -54,7 +69,7 @@ public final class AgentBridge: @unchecked Sendable {
     /// `screenSize()` reports) to the device's native portrait pixels with the
     /// same mapping the canvas uses. Points outside the screenshot are refused.
     private func nativePoint(x: Double, y: Double) throws -> TargetPixelPoint {
-        guard let frame = lock.withLock({ frame }) else {
+        guard let frame else {
             throw Failure.noSession
         }
         let screenshot = Viewport(
@@ -139,8 +154,30 @@ public final class AgentBridge: @unchecked Sendable {
     }
 
     private func send(_ command: DeviceCommand) async throws {
-        guard let session = lock.withLock({ session }) else { throw Failure.noSession }
-        try await session.command(command)
+        guard let grant = lock.withLock({ grant }) else { throw Failure.noSession }
+        try await grant.coordinator.command(
+            command,
+            attemptID: grant.attemptID,
+            sessionID: grant.sessionID,
+            authorization: grant.frame.metadata
+        )
+    }
+}
+
+extension AgentBridge: DependencyKey {
+    public static var liveValue: AgentBridge {
+        .shared
+    }
+
+    public static var testValue: AgentBridge {
+        AgentBridge()
+    }
+}
+
+extension DependencyValues {
+    var agentBridge: AgentBridge {
+        get { self[AgentBridge.self] }
+        set { self[AgentBridge.self] = newValue }
     }
 }
 

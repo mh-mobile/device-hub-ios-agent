@@ -228,7 +228,6 @@ extension RemoteSessionFeature {
                 if Task.isCancelled {
                     return
                 }
-                AgentBridge.shared.update(session: session, frame: frame)
                 await send(
                     .frameReceived(
                         attemptID: attemptID,
@@ -285,5 +284,28 @@ extension DeviceSessionEvent {
              .videoFrame:
             false
         }
+    }
+}
+
+struct AgentGrantKey: Equatable {
+    let attemptID: UUID
+    let sessionID: DeviceSessionID
+    let metadata: ScreenMetadata
+}
+
+extension RemoteSessionFeature {
+    /// Hands the agent API the current grant, or revokes it.
+    func grantAgent(state: State) -> Effect<Action> {
+        let grant = state.agentGrantKey.flatMap { key in
+            state.session?.frame.map { frame in
+                AgentBridge.Grant(
+                    attemptID: key.attemptID,
+                    sessionID: key.sessionID,
+                    frame: frame,
+                    coordinator: sessionCoordinator
+                )
+            }
+        }
+        return .run { [agentBridge] _ in agentBridge.set(grant) }
     }
 }
