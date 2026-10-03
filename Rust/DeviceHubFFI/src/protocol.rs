@@ -809,7 +809,10 @@ async fn run_control_stream(
                                     audio_stream = Some(AudioStreamIdentity {
                                         payload_type: packet.payload_type,
                                         ssrc: packet.ssrc,
+                                        last_sequence: packet.sequence_number,
                                     });
+                                } else if let Some(stream) = audio_stream.as_mut() {
+                                    stream.last_sequence = packet.sequence_number;
                                 }
                                 if let Some(last) = last_audio_sequence
                                     && packet.sequence_number != last.wrapping_add(1)
@@ -2233,24 +2236,38 @@ const fn orientation_state_failed() -> PublicFailure {
 /// Media datagram events must carry at least one byte (the Swift decoder fails
 /// the whole session otherwise), so RTCP, malformed packets, and header-only or
 /// padding-only RTP are dropped here instead of reaching the controller.
+/// How far ahead of the last audio sequence number a packet that also
+/// matches RTCP's structure may be and still count as the stream's RTP
+/// (allowing for a few lost packets).
+const AUDIO_SEQUENCE_WINDOW: u16 = 8;
+
 /// The audio stream's payload type and SSRC, learned from a packet that
-/// cannot be RTCP.
+/// cannot be RTCP, and its latest sequence number.
 #[derive(Clone, Copy)]
 struct AudioStreamIdentity {
     payload_type: u8,
     ssrc: u32,
+    last_sequence: u16,
 }
 
 /// `stream` is the audio stream's identity once a packet that cannot be RTCP
 /// has shown it.
 fn audio_rtp_packet(datagram: &[u8], stream: Option<AudioStreamIdentity>) -> Option<RtpPacket<'_>> {
-    // A structural RTCP match is kept as RTP only if it carries both the
-    // stream's marked payload type and its SSRC where RTP keeps them. The
-    // SSRC alone is not enough: RTPFB and PSFB name the media source SSRC at
-    // the same bytes.
+    // A structural RTCP match is kept as RTP only if it carries the stream's
+    // marked payload type and SSRC where RTP keeps them and continues its
+    // sequence. The SSRC alone is not enough: RTPFB and PSFB name the media
+    // source SSRC at the same bytes, and their types read as payload types
+    // 77 and 78. Feedback matching all three is still taken as RTP.
     let is_stream_packet = stream.is_some_and(|stream| {
         datagram.get(1) == Some(&(0x80 | stream.payload_type))
             && datagram.get(8..12) == Some(&stream.ssrc.to_be_bytes()[..])
+            && datagram.get(2..4).is_some_and(|sequence| {
+                // Feedback whose type reads as the stream's payload type has
+                // its length here, which rarely continues the sequence.
+                let ahead = u16::from_be_bytes([sequence[0], sequence[1]])
+                    .wrapping_sub(stream.last_sequence);
+                (1..=AUDIO_SEQUENCE_WINDOW).contains(&ahead)
+            })
     });
     if is_audio_rtcp(datagram) && !is_stream_packet {
         return None;
@@ -2914,6 +2931,7 @@ mod tests {
         let stream = Some(AudioStreamIdentity {
             payload_type: 79,
             ssrc: 2,
+            last_sequence: 2,
         });
         assert_eq!(
             audio_rtp_packet(&packet, stream).map(|packet| packet.payload.to_vec()),
@@ -2946,6 +2964,38 @@ mod tests {
             assert!(
                 audio_rtp_packet(&feedback, stream).is_none(),
                 "feedback {packet_type} naming the stream"
+            );
+        }
+        // Feedback whose type reads as the stream's own marked payload type
+        // (205 = 0x80 | 77, 206 = 0x80 | 78) and that names the stream's SSRC:
+        // its length field (3) does not continue the stream's sequence.
+        for (packet_type, payload_type) in [(205_u8, 77_u8), (206, 78)] {
+            let stream = Some(AudioStreamIdentity {
+                payload_type,
+                ssrc: 2,
+                last_sequence: 100,
+            });
+            let feedback = [
+                0x80,
+                packet_type,
+                0x00,
+                0x03,
+                0,
+                0,
+                0,
+                7,
+                0,
+                0,
+                0,
+                2,
+                0,
+                0,
+                0,
+                0,
+            ];
+            assert!(
+                audio_rtp_packet(&feedback, stream).is_none(),
+                "feedback {packet_type} with stream payload type {payload_type}"
             );
         }
     }
