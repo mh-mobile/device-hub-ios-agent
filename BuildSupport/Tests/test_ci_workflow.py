@@ -57,9 +57,9 @@ class CILocalGateContractTests(unittest.TestCase):
                 subprocess.run(("xcrun", "ar", "rcs", str(archive), str(object_path)), check=True)
                 return archive
 
-            def violations(archive: Path) -> str:
+            def violations(archive: Path, platform: int = 2) -> str:
                 return subprocess.run(
-                    ("bash", "-c", f"{function.group(0)}\nlibrary_version_violations \"$1\" 2 LC_VERSION_MIN_IPHONEOS 26.0", "_", str(archive)),
+                    ("bash", "-c", f"{function.group(0)}\nlibrary_version_violations \"$1\" {platform} 26.0", "_", str(archive)),
                     check=True,
                     capture_output=True,
                     text=True,
@@ -69,6 +69,10 @@ class CILocalGateContractTests(unittest.TestCase):
             self.assertEqual(violations(library("ios17", "iphoneos", "arm64-apple-ios17.0")), "")
             self.assertIn("minos 27.0", violations(library("ios27", "iphoneos", "arm64-apple-ios27.0")))
             self.assertIn("platform 1", violations(library("macos", "macosx", "arm64-apple-macos14.0")))
+            # Old-format simulator objects carry LC_VERSION_MIN_IPHONEOS too;
+            # there is no simulator-specific version-min command.
+            old_simulator = library("sim11", "iphonesimulator", "x86_64-apple-ios11.0-simulator")
+            self.assertEqual(violations(old_simulator, platform=7), "")
 
     def test_ci_keeps_the_outer_guard_while_nested_mise_tasks_reacquire_their_lock(self) -> None:
         source = CI_PATH.read_text()

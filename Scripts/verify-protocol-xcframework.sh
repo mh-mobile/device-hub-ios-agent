@@ -47,14 +47,16 @@ trap 'rm -rf "$temporary_directory"' EXIT
 # a newer OS than the slice promises. Older minimums (prebuilt standard
 # library objects) are fine. The smoke executable below cannot catch this:
 # its own minimum comes from the flag passed to clang.
+#
+# Older objects use LC_VERSION_MIN_IPHONEOS for both device and simulator
+# (there is no simulator-specific command); LC_BUILD_VERSION carries the
+# platform (2 device, 7 simulator).
 library_version_violations() {
   local library="$1"
   local build_platform="$2"
-  local version_min_command="$3"
-  local maximum="$4"
+  local maximum="$3"
   /usr/bin/otool -l "$library" | awk \
     -v platform="$build_platform" \
-    -v version_min="$version_min_command" \
     -v maximum="$maximum" '
     function number(version, parts) {
       split(version, parts, ".")
@@ -68,10 +70,10 @@ library_version_violations() {
     command == "LC_BUILD_VERSION" && $1 == "minos" && number($2) > number(maximum) {
       print object ": minos " $2
     }
-    command ~ /^LC_VERSION_MIN_/ && command != version_min && $1 == "version" {
+    command ~ /^LC_VERSION_MIN_/ && command != "LC_VERSION_MIN_IPHONEOS" && $1 == "version" {
       print object ": " command
     }
-    command == version_min && $1 == "version" && number($2) > number(maximum) {
+    command == "LC_VERSION_MIN_IPHONEOS" && $1 == "version" && number($2) > number(maximum) {
       print object ": version " $2
     }
   '
@@ -100,13 +102,9 @@ verify_slice() {
     exit 1
   fi
 
-  local version_min_command="LC_VERSION_MIN_IPHONEOS"
-  if [[ "$expected_platform" == 7 ]]; then
-    version_min_command="LC_VERSION_MIN_IPHONESIMULATOR"
-  fi
   local violations
   violations="$(library_version_violations \
-    "$library" "$expected_platform" "$version_min_command" "$EXPECTED_MINIMUM")"
+    "$library" "$expected_platform" "$EXPECTED_MINIMUM")"
   if [[ -n "$violations" ]]; then
     echo "error: $sdk library has objects for another platform or a newer OS:" >&2
     echo "$violations" >&2
