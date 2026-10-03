@@ -2225,7 +2225,11 @@ const fn orientation_state_failed() -> PublicFailure {
 /// the whole session otherwise), so RTCP, malformed packets, and header-only or
 /// padding-only RTP are dropped here instead of reaching the controller.
 fn audio_rtp_packet(datagram: &[u8]) -> Option<RtpPacket<'_>> {
-    if is_rtcp(datagram) {
+    // Not `is_rtcp`: its RFC 5761 range (192..=223) is safe for video, whose
+    // payload type is negotiated outside 64..=95, but audio's is not, so a
+    // marked audio packet could land there. Only the RTCP types in use (SR
+    // through PSFB) are dropped.
+    if datagram.len() >= 4 && datagram[0] >> 6 == 2 && (200..=206).contains(&datagram[1]) {
         return None;
     }
     RtpPacket::parse_checked(datagram)
@@ -2804,6 +2808,40 @@ mod tests {
             "RTCP"
         );
         assert!(audio_rtp_packet(&[0x80]).is_none(), "truncated");
+    }
+
+    #[test]
+    fn audio_with_a_marked_payload_type_in_the_rtcp_range_is_kept() {
+        // Audio payload types are not negotiated away from 64..=95, so a
+        // marked packet (second byte 0x80 | PT) can fall in 192..=223 without
+        // being RTCP. Only the RTCP types actually used are filtered.
+        for payload_type in [64_u8, 66, 79, 95] {
+            let mut packet = vec![
+                0x80,
+                0x80 | payload_type,
+                0x00,
+                0x01,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                2,
+            ];
+            packet.extend_from_slice(&[0xAB]);
+            assert!(
+                audio_rtp_packet(&packet).is_some(),
+                "marked audio with payload type {payload_type}"
+            );
+        }
+        for packet_type in 200_u8..=206 {
+            assert!(
+                audio_rtp_packet(&[0x81, packet_type, 0x00, 0x01, 0, 0, 0, 1, 0xAB]).is_none(),
+                "RTCP packet type {packet_type}"
+            );
+        }
     }
 
     #[test]
